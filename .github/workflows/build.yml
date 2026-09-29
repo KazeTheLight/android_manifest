@@ -110,6 +110,56 @@ jobs:
           echo "  drivers/kernelsu -> terhapus"
           echo "OK: KernelSU dibuang dari tree"
 
+      - name: Config hardening produksi
+        run: |
+          set -euo pipefail
+          KDIR=kernel-6.6
+          DEFCONFIG="$KDIR/arch/arm64/configs/gki_defconfig"
+
+          off() {
+            local sym="$1"
+            if grep -qE "^CONFIG_${sym}=" "$DEFCONFIG"; then
+              local before
+              before=$(grep -E "^CONFIG_${sym}=" "$DEFCONFIG" | head -1)
+              sed -i "s/^CONFIG_${sym}=.*/# CONFIG_${sym} is not set/" "$DEFCONFIG"
+              echo "    off: $before"
+            else
+              echo "    skip: CONFIG_$sym (tidak ada di defconfig)"
+            fi
+          }
+
+          echo "=== 1) Sanitizer + overhead debug (harus OFF di produksi) ==="
+          for s in KASAN KASAN_INLINE UBSAN DEBUG_INFO DEBUG_INFO_DWARF5 \
+                   DEBUG_INFO_REDUCED SCHED_DEBUG KFENCE KUNIT; do
+            off "$s"
+          done
+
+          echo "=== 2) Semua modul tes KUNIT ==="
+          echo "  ditemukan: $(grep -cE '^CONFIG_[A-Z0-9_]+_KUNIT_TEST=' "$DEFCONFIG")"
+          sed -i -E 's/^CONFIG_([A-Z0-9_]+_KUNIT_TEST)=.*/# CONFIG_\1 is not set/' "$DEFCONFIG"
+
+          echo "=== 3) Driver tidak relevan untuk HP ==="
+          for s in USB_SERIAL USB_ACM USB_MON \
+                   HID_APPLE HID_APPLEIR HID_PRODIKEYS HID_LOGITECH HID_LOGITECH_DJ \
+                   HID_LOGITECH_HIDPP HID_MAGICMOUSE HID_MICROSOFT HID_WACOM \
+                   HID_WIIMOTE HID_UCLOGIC; do
+            off "$s"
+          done
+
+          echo
+          echo "=== verifikasi ==="
+          fail=0
+          for s in KASAN UBSAN DEBUG_INFO SCHED_DEBUG KFENCE KUNIT; do
+            if grep -qE "^CONFIG_${s}=" "$DEFCONFIG"; then
+              echo "::error:: CONFIG_$s masih aktif"; fail=1
+            fi
+          done
+          if grep -qE "^CONFIG_[A-Z0-9_]+_KUNIT_TEST=" "$DEFCONFIG"; then
+            echo "::error:: masih ada KUNIT_TEST aktif"; fail=1
+          done
+          if [ "$fail" = 1 ]; then exit 1; fi
+          echo "  OK: sanitizer, debug overhead, KUNIT, dan driver bloat sudah mati"
+
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
