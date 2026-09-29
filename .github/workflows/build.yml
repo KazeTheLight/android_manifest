@@ -271,11 +271,11 @@ jobs:
     name: Create Release
     needs: [prepare, build_kernel]
     runs-on: ubuntu-latest
-    if: inputs.package_full
     permissions:
       contents: write
     env:
       TAG: K-One-Kernel-${{ needs.prepare.outputs.date }}
+      DATE: ${{ needs.prepare.outputs.date }}
 
     steps:
       - name: Checkout repository
@@ -292,26 +292,41 @@ jobs:
           git tag -a "$TAG" -m "K-One-Kernel $TAG"
           git push origin "$TAG"
 
-      - name: Download all artifacts
+      - name: Download zip flashable saja
         uses: actions/download-artifact@v4
         with:
-          path: artifact
+          name: K-One-Kernel-${{ env.DATE }}
+          path: release-asset
 
-      - name: Upload artifacts to release
+      - name: Pasang zip flashable ke release
         uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.TAG }}
-          files: artifact/**
+          name: K-One-Kernel ${{ env.DATE }}
+          fail_on_unmatched_files: true
+          files: release-asset/K-One-Kernel-${{ env.DATE }}.zip
           body: |
             ## K-One-Kernel
 
             Device Target: POCO X8 Pro / Redmi Turbo 5 (`klee`)
             SoC: MediaTek MT6899
-            Kernel: GKI 6.6.89-android15 (branch `android15-6.6-2025-09`)
-            Toolchain: Bazel/Kleaf (Clang r510928)
+            Kernel: `6.6.89-android15-8-maybe-dirty-K-One-Kernel`
+            Base: GKI `android15-6.6-2025-09`
+            Toolchain: Bazel/Kleaf, Clang r510928
             Root: none (KernelSU removed)
+
+            ### Flash
+            1. Unduh `K-One-Kernel-${{ env.DATE }}.zip` di bawah (langsung flashable, tanpa ekstrak ganda)
+            2. Recovery → Install → pilih file itu
+            3. Reboot
+
+            ### PENTING sebelum flash
+            `CONFIG_LOCALVERSION` ikut ter-embed ke `vermagic` setiap modul.
+            Pastikan `adb shell uname -r` di perangkat menghasilkan string yang
+            sama persis dengan `Kernel Version` di atas. Jika berbeda, modul
+            vendor akan gagal dimuat.
 
             ### Changelog
             - read the commits.
