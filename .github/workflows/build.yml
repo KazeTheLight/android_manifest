@@ -1,4 +1,4 @@
-name: K-One-Kernel — Build & Release
+done: K-One-Kernel — Build & Release
 
 on:
   workflow_dispatch:
@@ -156,7 +156,7 @@ jobs:
           done
           if grep -qE "^CONFIG_[A-Z0-9_]+_KUNIT_TEST=" "$DEFCONFIG"; then
             echo "::error:: masih ada KUNIT_TEST aktif"; fail=1
-          done
+          fi
           if [ "$fail" = 1 ]; then exit 1; fi
           echo "  OK: sanitizer, debug overhead, KUNIT, dan driver bloat sudah mati"
 
