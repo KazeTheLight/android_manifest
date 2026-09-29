@@ -113,6 +113,28 @@ jobs:
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+      - name: Siapkan signing key modul
+        run: |
+          set -euo pipefail
+          # gki_defconfig mengaktifkan CONFIG_MODULE_SIG_ALL=y dengan
+          # CONFIG_MODULE_SIG_KEY="certs/signing_key.pem", jadi setiap .ko wajib
+          # ditandatangani saat modules_install. Build via bazel tidak
+          # meng-generate key itu seperti `make` biasa lakukan, sehingga
+          # sign-file gagal dengan NO_SUCH_FILE dan seluruh .ko gagal di-sign.
+          #
+          # Key di bawah hanya dipakai agar modul bisa ditandatangani saat
+          # build. Ini bukan key rilis: jangan pernah pakai untuk release
+          # signature, dan jangan pernah commit ke repo.
+          CERTS=kernel-6.6/certs
+          mkdir -p "$CERTS"
+          openssl req -new -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+            -keyout "$CERTS/signing_key.pem" \
+            -out "$CERTS/signing_key.x509" \
+            -subj "/CN=K-One-Kernel CI build key" 2>/dev/null
+          echo "  signing_key.pem  -> $(stat -c%s "$CERTS/signing_key.pem") bytes"
+          echo "  signing_key.x509 -> $(stat -c%s "$CERTS/signing_key.x509") bytes"
+          openssl x509 -in "$CERTS/signing_key.x509" -noout -subject -dates | sed 's/^/  /'
+
       - name: Build kernel
         run: ./kernel_device_modules-6.6/build.sh
 
