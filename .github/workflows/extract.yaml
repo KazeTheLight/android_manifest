@@ -3,68 +3,95 @@ name: Extract Image from Artifact
 on:
   workflow_dispatch:
     inputs:
-      run_id:
-        description: 'Run ID sumber (artifact kernel ada di sini)'
-        required: true
-        default: '36551268265'
       artifact_name:
-        description: 'Nama artifact'
-        required: true
-        default: 'kernel-202609291645'
+        description: 'Nama artifact (KOSONGKAN = otomatis pakai kernel terbaru)'
+        required: false
+        default: ''
 
 jobs:
   extract:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - name: Download artifact dari run sebelumnya
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_name }}
-          run-id: ${{ inputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: artifact-src
-
-      - name: Petakan struktur artifact
+      - name: Cari artifact kernel
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WANT: ${{ inputs.artifact_name }}
         run: |
-          cd artifact-src
-          echo "=== ukuran total ==="
-          du -sh .
+          set -euo pipefail
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+               -o art.json
+
+          echo "=== semua artifact di ${GITHUB_REPOSITORY} ==="
+          jq -r '.artifacts
+                 | sort_by(.created_at) | reverse
+                 | .[] | "\(.created_at[0:19])  \(.size_in_bytes/1048576*100|round/100) MB  expired=\(.expired)  \(.name)"' \
+               art.json
           echo
-          echo "=== struktur (depth 3, 80 baris) ==="
-          find . -maxdepth 3 | head -80
+
+          SEL=$(jq -r --arg w "$WANT" '
+            [ .artifacts[]
+              | select(.name | test("^kernel-[0-9]{8}"))
+              | select(.expired == false) ]
+            | sort_by(.created_at) | reverse
+            | (if ($w|length)>0 then (map(select(.name==$w)) | .[0]) else .[0] end)
+            | if . == null then empty else "\(.id)\t\(.name)" end
+          ' art.json)
+
+          if [ -z "$SEL" ]; then
+            echo "ERROR: artifact tidak ditemukan (diminta: '${WANT}')"
+            jq -r '.artifacts[] | select(.name | test("^kernel-[0-9]{8}")) | .name' art.json
+            exit 1
+          fi
+
+          echo ">>> TERPILIH: $(echo "$SEL" | cut -f2)  (id $(echo "$SEL" | cut -f1))"
+          echo "id=$(echo "$SEL" | cut -f1)"   >> "$GITHUB_OUTPUT"
+          echo "name=$(echo "$SEL" | cut -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifact terpilih
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ steps.find.outputs.id }}/zip" \
+               -o artifact.zip
+          ls -la artifact.zip
+          mkdir -p artifact-src
+          unzip -q artifact.zip -d artifact-src
+          echo "=== struktur (depth 3) ==="
+          find artifact-src -maxdepth 3 | head -60
 
       - name: Temukan Image
         run: |
+          set -euo pipefail
           cd artifact-src
-          echo "=== semua kandidat ==="
-          find . \( -name "Image" -o -name "Image.*" -o -name "Image-*" -o -name "vmlinux" \) \
-            -type f -printf "%s\t%p\n" | sort -rn | head -20
+          echo "=== kandidat Image / vmlinux ==="
+          find . -type f \( -name "Image" -o -name "Image.*" -o -name "Image-*" -o -name "vmlinux" \) \
+            -printf "%s\t%p\n" | sort -rn | head -20
 
-      - name: Salin Image ke artifact kecil
+      - name: Salin Image
         run: |
           set -euo pipefail
           cd artifact-src
           IMG=$(find . -type f \( -name "Image" -o -name "Image.*" -o -name "Image-*" \) \
                 ! -name "*.dtb" -printf "%s\t%p\n" | sort -rn | head -1 | cut -f2-)
           if [ -z "$IMG" ]; then
-            echo "ERROR: tidak ada file Image"
-            find . -maxdepth 4 -type d | head -40
-            exit 1
+            echo "ERROR: tidak ada file Image"; find . -maxdepth 4 -type d | head -40; exit 1
           fi
           echo "=== IMAGE: $IMG ==="
           ls -la "$IMG"
-          echo
-          echo "=== tipe file ==="
           file "$IMG" || true
-          echo
-          echo "=== sha256 ==="
           sha256sum "$IMG"
-          echo
           mkdir -p ../out
-          cp "$IMG" ../out/
-          cp "$IMG" "../out/$(basename "$IMG").$(date +%Y%m%d%H%M)" 2>/dev/null || true
+          cp "$IMG" "../out/$(basename "$IMG")"
           echo
-          echo "=== isi out/ ==="
           ls -la ../out/
 
       - name: Laporkan versi kernel dari dalam Image
@@ -72,24 +99,25 @@ jobs:
           set -euo pipefail
           for f in out/*; do
             [ -f "$f" ] || continue
-            echo "### $f"
-            echo "--- header 32 byte (hex) ---"
+            echo "######## $f ########"
+            echo "--- 32 byte pertama ---"
             xxd -l 32 "$f" || true
-            echo "--- uncompress lalu cari version string ---"
             TMP=$(mktemp)
             case "$f" in
-              *.gz)  gunzip -c  "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
+              *.gz)  gunzip -c "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
               *.lz4) lz4 -d -c "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
-              *.xz)  xz -dc   "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
+              *.xz)  xz -dc  "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
               *)     cp "$f" "$TMP" ;;
             esac
-            strings "$TMP" | grep -m3 -E "Linux version [0-9]" || echo "  (tidak ada version string di uncompressed)"
-            strings "$TMP" | grep -m1 -E "android1[5-9]|klee" || true
-            rm -f "$TMP"
+            echo "--- version string ---"
+            strings "$TMP" | grep -m3 -E "Linux version [0-9]" || echo "  (tidak ketemu)"
+            echo "--- jejak klee ---"
+            strings "$TMP" | grep -m3 -iE "klee" || echo "  (tidak ada)"
             echo
+            rm -f "$TMP"
           done
 
-      - name: Upload Image (kecil)
+      - name: Upload Image
         uses: actions/upload-artifact@v4
         with:
           name: kernel-image
