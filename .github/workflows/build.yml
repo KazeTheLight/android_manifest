@@ -160,6 +160,74 @@ jobs:
           if [ "$fail" = 1 ]; then exit 1; fi
           echo "  OK: sanitizer, debug overhead, KUNIT, dan driver bloat sudah mati"
 
+      - name: Sinkronkan daftar modul dengan config hardening
+        run: |
+          set -euo pipefail
+          KDIR=kernel-6.6
+
+          MODULES=(
+            drivers/usb/class/cdc-acm.ko
+            drivers/usb/mon/usbmon.ko
+            drivers/usb/serial/ftdi_sio.ko
+            drivers/usb/serial/usbserial.ko
+            lib/kunit/kunit.ko
+            lib/kunit/kunit-example-test.ko
+            lib/kunit/kunit-test.ko
+            drivers/base/regmap/regmap-kunit.ko
+            drivers/base/regmap/regmap-ram.ko
+            drivers/base/regmap/regmap-raw-ram.ko
+            drivers/hid/hid-uclogic-test.ko
+            drivers/iio/test/iio-test-format.ko
+            drivers/input/tests/input_test.ko
+            drivers/rtc/lib_test.ko
+            fs/ext4/ext4-inode-test.ko
+            fs/fat/fat_test.ko
+            kernel/time/time_test.ko
+            net/core/dev_addr_lists_test.ko
+            sound/soc/soc-topology-test.ko
+            sound/soc/soc-utils-test.ko
+            drivers/clk/clk-gate_test.ko
+            drivers/clk/clk_test.ko
+          )
+
+          # Cari semua file .bzl yang mendaftarkan modul-modul ini
+          mapfile -t FILES < <(grep -rlE 'cdc-acm\.ko|kunit\.ko' \
+            "$KDIR" . --include='*.bzl' 2>/dev/null | sort -u)
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error:: tidak menemukan file .bzl yang memuat daftar modul"
+            exit 1
+          fi
+
+          echo "File daftar modul yang ditemukan:"
+          printf '  %s\n' "${FILES[@]}"
+
+          removed=0
+          for f in "${FILES[@]}"; do
+            for m in "${MODULES[@]}"; do
+              if grep -qF "\"$m\"" "$f"; then
+                sed -i "\|\"$m\"|d" "$f"
+                echo "    hapus: $m  ($f)"
+                removed=$((removed + 1))
+              fi
+            done
+          done
+          echo "Total entri dihapus: $removed"
+
+          echo
+          echo "=== verifikasi ==="
+          fail=0
+          for f in "${FILES[@]}"; do
+            for m in "${MODULES[@]}"; do
+              if grep -qF "\"$m\"" "$f"; then
+                echo "::error:: $m masih terdaftar di $f"
+                fail=1
+              fi
+            done
+          done
+          if [ "$fail" = 1 ]; then exit 1; fi
+          echo "  OK: daftar modul sudah sinkron dengan config"
+
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
