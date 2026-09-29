@@ -6,7 +6,7 @@ on:
       package_full:
         description: 'Buat artifact lengkap (~900MB)? false = hanya Image kecil'
         type: boolean
-        default: true
+        default: false
 
 env:
   KERNEL_MANIFEST_URL: https://android.googlesource.com/kernel/manifest
