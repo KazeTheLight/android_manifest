@@ -46,8 +46,8 @@ diff -ruN a/init/Kconfig b/init/Kconfig
  	select CGROUPS
 diff -ruN a/kernel/sched/cass.c b/kernel/sched/cass.c
 --- a/kernel/sched/cass.c	1970-01-01 07:00:00.000000000 +0700
-+++ b/kernel/sched/cass.c	2026-09-29 20:15:38.090410022 +0700
-@@ -0,0 +1,246 @@
++++ b/kernel/sched/cass.c	2026-09-29 20:38:05.182172196 +0700
+@@ -0,0 +1,249 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Copyright (C) 2023-2024 Sultan Alsawaf <sultan@kerneltoast.com>.
@@ -96,7 +96,7 @@ diff -ruN a/kernel/sched/cass.c b/kernel/sched/cass.c
 +	/* Get this CPU's utilization from CFS tasks */
 +	c->util = READ_ONCE(cfs_rq->avg.util_avg);
 +	if (sched_feat(UTIL_EST)) {
-+		est = READ_ONCE(cfs_rq->avg.util_est.enqueued);
++		est = READ_ONCE(cfs_rq->avg.util_est);
 +		if (est > c->util) {
 +			/* Don't deduct @current's util from estimated util */
 +			sync = false;
@@ -266,6 +266,9 @@ diff -ruN a/kernel/sched/cass.c b/kernel/sched/cass.c
 +			wake_flags, &target_cpu);
 +	if (target_cpu >= 0)
 +		return target_cpu;
++
++	/* required for stable ->cpus_allowed */
++	lockdep_assert_held(&p->pi_lock);
 +
 +	/* Don't balance on exec since we don't know what @p will look like */
 +	if (sd_flag & SD_BALANCE_EXEC)
