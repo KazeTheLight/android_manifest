@@ -1,4 +1,4 @@
-done: K-One-Kernel — Build & Release
+name: K-One-Kernel — Build & Release
 
 on:
   workflow_dispatch:
