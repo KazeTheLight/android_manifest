@@ -1,4 +1,4 @@
-name: Extract Image from Artifact
+name: K-One-Kernel — Extract Image
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ jobs:
 
           SEL=$(jq -r --arg w "$WANT" '
             [ .artifacts[]
-              | select(.name | test("^kernel-[0-9]{8}"))
+              | select(.name | test("^K-One-Kernel-dist-[0-9]{8}"))
               | select(.expired == false) ]
             | sort_by(.created_at) | reverse
             | (if ($w|length)>0 then (map(select(.name==$w)) | .[0]) else .[0] end)
@@ -45,7 +45,7 @@ jobs:
 
           if [ -z "$SEL" ]; then
             echo "ERROR: artifact tidak ditemukan (diminta: '${WANT}')"
-            jq -r '.artifacts[] | select(.name | test("^kernel-[0-9]{8}")) | .name' art.json
+            jq -r '.artifacts[] | select(.name | test("^K-One-Kernel-dist-[0-9]{8}")) | .name' art.json
             exit 1
           fi
 
@@ -136,7 +136,7 @@ jobs:
       - name: Upload Image
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-image
+          name: K-One-Kernel-Image
           path: out/
           if-no-files-found: error
           retention-days: 30

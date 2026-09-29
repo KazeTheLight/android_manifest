@@ -1,0 +1,35 @@
+Subject: [PATCH] kernel/arm64: identity as K-One-Kernel
+
+T nominally kernel jadi K-One-Kernel:
+  - NAME di Makefile          -> banner boot / uname -a (aman)
+  - CONFIG_LOCALVERSION       -> uname -r (berbahaya)
+
+CONFIG_LOCALVERSION ikut ter-embed ke vermagic setiap modul, jadi suffix
+WAJIB sama persis dengan output 'adb shell uname -r' di perangkat. Jika
+berbeda, modul vendor akan gagal dimuat.
+
+Hasil yang diharapkan:
+  uname -r = 6.6.89-android15-8-maybe-dirty-K-One-Kernel
+
+--- a/Makefile
++++ b/Makefile
+@@ -3,7 +3,7 @@
+ PATCHLEVEL = 6
+ SUBLEVEL = 89
+ EXTRAVERSION =
+-NAME = Pinguïn Aangedreven
++NAME = K-One-Kernel
+ 
+ # *DOCUMENTATION*
+ # To see a list of typical targets execute "make help"
+--- a/arch/arm64/configs/gki_defconfig
++++ b/arch/arm64/configs/gki_defconfig
+@@ -4,7 +4,7 @@
+ CONFIG_INIT_ENV_ARG_LIMIT=32
+ # CONFIG_COMPILE_TEST is not set
+ CONFIG_WERROR=y
+-CONFIG_LOCALVERSION="-rethinking"
++CONFIG_LOCALVERSION="-K-One-Kernel"
+ CONFIG_LOCALVERSION_AUTO=y
+ CONFIG_BUILD_SALT=""
+ CONFIG_DEFAULT_INIT=""

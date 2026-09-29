@@ -1,0 +1,4 @@
+# Image di-inject oleh workflow, jangan di-commit
+Image
+Image.gz
+*.zip

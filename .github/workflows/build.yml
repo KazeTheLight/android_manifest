@@ -1,4 +1,4 @@
-name: Build Kernel and Release
+name: K-One-Kernel — Build & Release
 
 on:
   workflow_dispatch:
@@ -53,6 +53,62 @@ jobs:
           repo init -u "$KERNEL_MANIFEST_URL" -b "$KERNEL_MANIFEST_BRANCH" --depth=1
           git clone "$LOCAL_MANIFEST_REPO" .repo/local_manifests
           repo sync --force-sync --no-clone-bundle --no-tags -j"$(nproc --all)"
+
+      - name: Terapkan patch K-One-Kernel
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(patches/*.patch)
+          if [ ${#PATCHES[@]} -eq 0 ]; then
+            echo "::error:: tidak ada patch di patches/*.patch"; exit 1
+          fi
+          for p in "${PATCHES[@]}"; do
+            echo "=== applying $p ==="
+            patch -p1 -d kernel-6.6 --forward --no-backup-if-mismatch < "$p"
+          done
+
+          echo
+          echo "=== verifikasi hasil patch ==="
+          grep -n '^NAME = ' kernel-6.6/Makefile
+          grep -n '^CONFIG_LOCALVERSION' kernel-6.6/arch/arm64/configs/gki_defconfig
+          if ! grep -q '^CONFIG_LOCALVERSION="-K-One-Kernel"$' kernel-6.6/arch/arm64/configs/gki_defconfig; then
+            echo "::error:: CONFIG_LOCALVERSION tidak sesuai harapan setelah patch"; exit 1
+          fi
+          echo
+          echo "::notice title=Localversion::diharapkan uname -r = 6.6.89-android15-8-maybe-dirty-K-One-Kernel"
+
+      - name: Hapus KernelSU
+        run: |
+          set -euo pipefail
+          KDIR=kernel-6.6
+          DEFCONFIG="$KDIR/arch/arm64/configs/gki_defconfig"
+
+          echo "=== CONFIG_KSU sebelum ==="
+          grep -n 'CONFIG_KSU' "$DEFCONFIG" || echo "  (tidak ada)"
+
+          # 1) Matikan config di defconfig GKI
+          sed -i 's/^CONFIG_KSU=y$/# CONFIG_KSU is not set/' "$DEFCONFIG"
+
+          # 2) Putuskan titik integrasi Kbuild/Kconfig
+          sed -i '/kernelsu/d' "$KDIR/drivers/Kconfig" "$KDIR/drivers/Makefile"
+
+          # 3) Buang sumbernya
+          rm -rf "$KDIR/drivers/kernelsu"
+
+          echo
+          echo "=== verifikasi ==="
+          if grep -qE '^CONFIG_KSU' "$DEFCONFIG"; then
+            echo "::error:: CONFIG_KSU masih aktif di defconfig"; exit 1
+          fi
+          if grep -n 'kernelsu' "$KDIR/drivers/Kconfig" "$KDIR/drivers/Makefile"; then
+            echo "::error:: masih ada referensi kernelsu di Kconfig/Makefile"; exit 1
+          fi
+          if [ -d "$KDIR/drivers/kernelsu" ]; then
+            echo "::error:: folder drivers/kernelsu masih ada"; exit 1
+          fi
+          echo "  CONFIG_KSU   -> $(grep -m1 'CONFIG_KSU' "$DEFCONFIG" || echo '(tidak ada sama sekali)')"
+          echo "  drivers/kernelsu -> terhapus"
+          echo "OK: KernelSU dibuang dari tree"
 
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -127,20 +183,73 @@ jobs:
             echo
           done
 
+      - name: Paket AnyKernel (flashable)
+        run: |
+          set -euo pipefail
+
+          if [ ! -d anykernel ]; then
+            echo "::error:: folder anykernel/ tidak ada di repo — commit template AnyKernel3 dulu"
+            exit 1
+          fi
+
+          IMG=$(find "$IMGOUT" -maxdepth 1 -type f ! -name '*.gz' \
+                  -printf '%s\t%p\n' | sort -rn | head -1 | cut -f2-)
+          if [ -z "$IMG" ]; then
+            echo "::error:: tidak ada Image di $IMGOUT"; exit 1
+          fi
+
+          WORK="$RUNNER_TEMP/ak"
+          cp -r anykernel "$WORK"
+          rm -f "$WORK"/Image "$WORK"/Image.gz "$WORK"/.gitignore
+
+          # WAJIB: hanya Image.gz, taruh di ROOT zip (ak3-core.sh mencari di root)
+          gzip -9 -c "$IMG" > "$WORK/Image.gz"
+          echo "Image.gz: $(stat -c%s "$WORK/Image.gz") bytes  sha256=$(sha256sum "$WORK/Image.gz" | cut -d' ' -f1)"
+
+          mkdir -p "$ARTIFACT"
+          ZIP="$ARTIFACT/K-One-Kernel-${DATE}.zip"
+          ( cd "$WORK" && zip -r9 "$ZIP" . )
+
+          echo
+          echo "=== isi zip (harus ada Image.gz + anykernel.sh di root) ==="
+          unzip -l "$ZIP" | head -25
+
+          # validasi: Image.gz wajib ada, Image polos tidak boleh ada (akan menimpa)
+          LIST=$(unzip -Z1 "$ZIP")
+          for req in Image.gz anykernel.sh META-INF/com/google/android/update-binary \
+                     META-INF/com/google/android/updater-script tools/ak3-core.sh; do
+            if ! printf '%s\n' "$LIST" | grep -qx "$req"; then
+              echo "::error:: $req tidak ada di root zip"; exit 1
+            fi
+          done
+          if printf '%s\n' "$LIST" | grep -qx 'Image'; then
+            echo "::error:: ada Image polos di zip — akan menimpa Image.gz"; exit 1
+          fi
+
+          echo "OK: $ZIP"
+
       - name: Paket artifact lengkap
         if: inputs.package_full
         run: |
           set -euo pipefail
           mkdir -p "$ARTIFACT"
           cd out/dist
-          zip -r9 "$ARTIFACT/kernel-${DATE}.zip" .
+          zip -r9 "$ARTIFACT/K-One-Kernel-dist-${DATE}.zip" .
           ls -la "$ARTIFACT/"
+
+      - name: Upload zip flashable AnyKernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: K-One-Kernel-${{ env.DATE }}
+          path: ${{ env.ARTIFACT }}/K-One-Kernel-${{ env.DATE }}.zip
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload Image kecil
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-image-${{ env.DATE }}
-          path: ${{ env.IMGOUT }}/
+          name: K-One-Kernel-Image-${{ env.DATE }}
+          path: ${{ env.IMGOUT }}
           if-no-files-found: error
           retention-days: 30
 
@@ -148,8 +257,9 @@ jobs:
         if: inputs.package_full
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ env.DATE }}
-          path: ${{ env.ARTIFACT }}/*
+          name: K-One-Kernel-dist-${{ env.DATE }}
+          path: ${{ env.ARTIFACT }}/K-One-Kernel-dist-${{ env.DATE }}.zip
+          if-no-files-found: error
           retention-days: 14
 
   create_release:
@@ -160,7 +270,7 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG: ${{ needs.prepare.outputs.date }}
+      TAG: K-One-Kernel-${{ needs.prepare.outputs.date }}
 
     steps:
       - name: Checkout repository
@@ -174,7 +284,7 @@ jobs:
 
       - name: Create git tag
         run: |
-          git tag -a "$TAG" -m "Beyond what's right, i want to live with you, raa."
+          git tag -a "$TAG" -m "K-One-Kernel $TAG"
           git push origin "$TAG"
 
       - name: Download all artifacts
@@ -190,10 +300,13 @@ jobs:
           tag_name: ${{ env.TAG }}
           files: artifact/**
           body: |
-            Device Target: POCO X8 Pro
-            Kernel Manifest: https://github.com/KazeTheLight/android_manifest.git
-            Kernel Branch: android15-6.6-2025-09 (GKI 6.6.89)
-            Clang Version: - (we're using bazel)
+            ## K-One-Kernel
 
-            ### Changelog:
-            - just read the commits.
+            Device Target: POCO X8 Pro / Redmi Turbo 5 (`klee`)
+            SoC: MediaTek MT6899
+            Kernel: GKI 6.6.89-android15 (branch `android15-6.6-2025-09`)
+            Toolchain: Bazel/Kleaf (Clang r510928)
+            Root: none (KernelSU removed)
+
+            ### Changelog
+            - read the commits.
