@@ -1,0 +1,317 @@
+diff -ruN a/arch/arm64/configs/gki_defconfig b/arch/arm64/configs/gki_defconfig
+--- a/arch/arm64/configs/gki_defconfig	2026-09-29 20:15:18.278257753 +0700
++++ b/arch/arm64/configs/gki_defconfig	2026-09-29 20:18:19.062379882 +0700
+@@ -93,6 +93,7 @@
+ CONFIG_IRQ_TIME_ACCOUNTING=y
+ CONFIG_HAVE_SCHED_AVG_IRQ=y
+ CONFIG_SCHED_THERMAL_PRESSURE=y
++CONFIG_SCHED_CASS=y
+ # CONFIG_BSD_PROCESS_ACCT is not set
+ CONFIG_TASKSTATS=y
+ CONFIG_TASK_DELAY_ACCT=y
+diff -ruN a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig	2026-09-29 20:15:18.276347495 +0700
++++ b/init/Kconfig	2026-09-29 20:16:31.298399501 +0700
+@@ -1276,6 +1276,31 @@
+ 
+ 	  If unsure, say N here.
+ 
++config SCHED_CASS
++	bool "Capacity Aware Superset Scheduler"
++	depends on SMP
++	help
++	  This enables the Capacity Aware Superset Scheduler (CASS), which
++	  optimizes runqueue selection of CFS tasks. By using CPU capacity as a
++	  basis for comparing the relative utilization between different CPUs,
++	  CASS fairly balances load across CPUs of varying capacities. This
++	  results in improved multi-core performance, especially when CPUs are
++	  overutilized because CASS doesn't clip a CPU's utilization when it
++	  eclipses the CPU's capacity.
++
++	  As a superset of capacity aware scheduling, CASS implements a
++	  hierarchy of criteria to determine the better CPU to wake a task upon
++	  between CPUs that have the same relative utilization. This way,
++	  single-core performance, latency, and cache affinity are all optimized
++	  where possible.
++
++	  CASS doesn't feature explicit energy awareness but its basic load
++	  balancing principle results in decreased overall energy, often better
++	  than what is possible with explicit energy awareness. By fairly
++	  balancing load based on relative utilization, all CPUs are kept at
++	  their lowest P-state necessary to satisfy the overall load at any
++	  given moment.
++
+ config SCHED_AUTOGROUP
+ 	bool "Automatic process group scheduling"
+ 	select CGROUPS
+diff -ruN a/kernel/sched/cass.c b/kernel/sched/cass.c
+--- a/kernel/sched/cass.c	1970-01-01 07:00:00.000000000 +0700
++++ b/kernel/sched/cass.c	2026-09-29 20:15:38.090410022 +0700
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2023-2024 Sultan Alsawaf <sultan@kerneltoast.com>.
++ *
++ * Ported to Android GKI 6.6 (android15-6.6). The original select_task_rq_fair()
++ * restricted vendor hook and the Android-specific WF_CURRENT_CPU handling are
++ * preserved so that vendor modules keep working.
++ */
++
++/**
++ * DOC: Capacity Aware Superset Scheduler (CASS) description
++ *
++ * The Capacity Aware Superset Scheduler (CASS) optimizes runqueue selection of
++ * CFS tasks. By using CPU capacity as a basis for comparing the relative
++ * utilization between different CPUs, CASS fairly balances load across CPUs of
++ * varying capacities. This results in improved multi-core performance,
++ * especially when CPUs are overutilized because CASS doesn't clip a CPU's
++ * utilization when it eclipses the CPU's capacity.
++ *
++ * As a superset of capacity aware scheduling, CASS implements a hierarchy of
++ * criteria to determine the better CPU to wake a task upon between CPUs that
++ * have the same relative utilization. This way, single-core performance,
++ * latency, and cache affinity are all optimized where possible.
++ *
++ * CASS doesn't feature explicit energy awareness but its basic load balancing
++ * principle results in decreased overall energy, often better than what is
++ * possible with explicit energy awareness. By fairly balancing load based on
++ * relative utilization, all CPUs are kept at their lowest P-state necessary to
++ * satisfy the overall load at any given moment.
++ */
++
++struct cass_cpu_cand {
++	int cpu;
++	unsigned int exit_lat;
++	unsigned long cap;
++	unsigned long util;
++};
++
++static __always_inline
++void cass_cpu_util(struct cass_cpu_cand *c, bool sync)
++{
++	struct rq *rq = cpu_rq(c->cpu);
++	struct cfs_rq *cfs_rq = &rq->cfs;
++	unsigned long est;
++
++	/* Get this CPU's utilization from CFS tasks */
++	c->util = READ_ONCE(cfs_rq->avg.util_avg);
++	if (sched_feat(UTIL_EST)) {
++		est = READ_ONCE(cfs_rq->avg.util_est.enqueued);
++		if (est > c->util) {
++			/* Don't deduct @current's util from estimated util */
++			sync = false;
++			c->util = est;
++		}
++	}
++
++	/* Get the capacity of this CPU adjusted for thermal pressure */
++	c->cap = arch_scale_cpu_capacity(c->cpu) - thermal_load_avg(rq);
++
++	/*
++	 * Account for lost capacity due to time spent in RT/DL tasks and IRQs.
++	 */
++	c->cap -= min(cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq),
++		      c->cap - 1);
++
++	/*
++	 * Deduct @current's util from this CPU if this is a sync wake, unless
++	 * @current is an RT task; RT tasks don't have per-entity load tracking.
++	 */
++	if (sync && c->cpu == smp_processor_id() && !task_has_rt_policy(current))
++		c->util -= min(c->util, task_util(current));
++}
++
++/* Returns true if @a is a better CPU than @b */
++static __always_inline
++bool cass_cpu_better(const struct cass_cpu_cand *a,
++		     const struct cass_cpu_cand *b,
++		     int prev_cpu, bool sync)
++{
++#define cass_cmp(a, b) ({ res = (a) - (b); })
++#define cass_eq(a, b) ({ res = (a) == (b); })
++	long res;
++
++	/* Prefer the CPU with lower relative utilization */
++	if (cass_cmp(b->util, a->util))
++		goto done;
++
++	/* Prefer the current CPU for sync wakes */
++	if (sync && (cass_eq(a->cpu, smp_processor_id()) ||
++		     !cass_cmp(b->cpu, smp_processor_id())))
++		goto done;
++
++	/* Prefer the CPU with higher capacity */
++	if (cass_cmp(a->cap, b->cap))
++		goto done;
++
++	/* Prefer the CPU with lower idle exit latency */
++	if (cass_cmp(b->exit_lat, a->exit_lat))
++		goto done;
++
++	/* Prefer the previous CPU */
++	if (cass_eq(a->cpu, prev_cpu) || !cass_cmp(b->cpu, prev_cpu))
++		goto done;
++
++	/* Prefer the CPU that shares a cache with the previous CPU */
++	if (cass_cmp(cpus_share_cache(a->cpu, prev_cpu),
++		     cpus_share_cache(b->cpu, prev_cpu)))
++		goto done;
++
++	/* @a isn't a better CPU than @b. @res must be <=0 to indicate such. */
++done:
++	/* @a is a better CPU than @b if @res is positive */
++	return res > 0;
++}
++
++static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync)
++{
++	/* Initialize @best such that @best always has a valid CPU at the end */
++	struct cass_cpu_cand cands[2], *best = cands;
++	bool has_idle = false;
++	unsigned long p_util;
++	int cidx = 0, cpu;
++
++	/* Get the utilization for this task */
++	p_util = clamp(task_util_est(p),
++		       uclamp_eff_value(p, UCLAMP_MIN),
++		       uclamp_eff_value(p, UCLAMP_MAX));
++
++	/*
++	 * Find the best CPU to wake @p on. @curr->cpu must be initialized
++	 * before this loop ends in order to ensure @best->cpu contains a valid
++	 * CPU upon returning; otherwise, if only one CPU is allowed and it is
++	 * skipped before @curr->cpu is set, then @best->cpu will be garbage.
++	 */
++	rcu_read_lock();
++	for_each_cpu_and(cpu, p->cpus_ptr, cpu_active_mask) {
++		/* Use the free candidate slot for @curr */
++		struct cass_cpu_cand *curr = &cands[cidx];
++		struct cpuidle_state *idle_state;
++
++		/*
++		 * Check if this CPU is idle or only has SCHED_IDLE tasks. For
++		 * sync wakes, always treat the current CPU as idle.
++		 */
++		if ((sync && cpu == smp_processor_id()) ||
++		    available_idle_cpu(cpu) || sched_idle_cpu(cpu)) {
++			/* Discard any previous non-idle candidate */
++			if (!has_idle)
++				best = curr;
++			has_idle = true;
++
++			/* Nonzero exit latency indicates this CPU is idle */
++			curr->exit_lat = 1;
++
++			/* Add on the actual idle exit latency, if any */
++			idle_state = idle_get_state(cpu_rq(cpu));
++			if (idle_state)
++				curr->exit_lat += idle_state->exit_latency;
++		} else {
++			/* Skip non-idle CPUs if there's an idle candidate */
++			if (has_idle)
++				continue;
++
++			/* Zero exit latency indicates this CPU isn't idle */
++			curr->exit_lat = 0;
++		}
++
++		/* Get this CPU's capacity and utilization */
++		curr->cpu = cpu;
++		cass_cpu_util(curr, sync);
++
++		/*
++		 * Add @p's utilization to this CPU if it's not @p's CPU, to
++		 * find what this CPU's relative utilization would look like if
++		 * @p were on it.
++		 */
++		if (cpu != task_cpu(p))
++			curr->util += p_util;
++
++		/* Calculate the relative utilization for this CPU candidate */
++		curr->util = curr->util * SCHED_CAPACITY_SCALE / curr->cap;
++
++		/*
++		 * Check if this CPU is better than the best CPU found so far.
++		 * If @best == @curr then there's no need to compare them, but
++		 * cidx still needs to be changed to the other candidate slot.
++		 */
++		if (best == curr ||
++		    cass_cpu_better(curr, best, prev_cpu, sync)) {
++			best = curr;
++			cidx ^= 1;
++		}
++	}
++	rcu_read_unlock();
++
++	return best->cpu;
++}
++
++static int cass_select_task_rq_fair(struct task_struct *p, int prev_cpu,
++				    int wake_flags)
++{
++	/* SD_flags and WF_flags share the first nibble */
++	int sd_flag = wake_flags & 0xF;
++	int target_cpu = -1;
++	bool sync;
++
++	/*
++	 * Android restricted vendor hook, preserved from the original
++	 * select_task_rq_fair() so that vendor modules can still override the
++	 * CPU placement decided by the scheduler.
++	 */
++	if (trace_android_rvh_select_task_rq_fair_enabled() &&
++	    !(sd_flag & SD_BALANCE_FORK))
++		sync_entity_load_avg(&p->se);
++	trace_android_rvh_select_task_rq_fair(p, prev_cpu, sd_flag,
++			wake_flags, &target_cpu);
++	if (target_cpu >= 0)
++		return target_cpu;
++
++	/* Don't balance on exec since we don't know what @p will look like */
++	if (sd_flag & SD_BALANCE_EXEC)
++		return prev_cpu;
++
++	/*
++	 * Android-specific: prefer the current CPU when the waker explicitly
++	 * asked for it.
++	 */
++	if ((wake_flags & WF_CURRENT_CPU) &&
++	    cpumask_test_cpu(smp_processor_id(), p->cpus_ptr))
++		return smp_processor_id();
++
++	/*
++	 * If there aren't any valid CPUs which are active, then just return the
++	 * first valid CPU since it's possible for certain types of tasks to run
++	 * on inactive CPUs.
++	 */
++	if (unlikely(!cpumask_intersects(p->cpus_ptr, cpu_active_mask)))
++		return cpumask_first(p->cpus_ptr);
++
++	/* cass_best_cpu() needs the task's utilization, so sync it up */
++	if (!(sd_flag & SD_BALANCE_FORK))
++		sync_entity_load_avg(&p->se);
++
++	sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
++	return cass_best_cpu(p, prev_cpu, sync);
++}
+diff -ruN a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c	2026-09-29 20:15:18.274239250 +0700
++++ b/kernel/sched/fair.c	2026-09-29 20:16:06.214404746 +0700
+@@ -13264,6 +13264,17 @@
+ 	return rr_interval;
+ }
+ 
++#ifdef CONFIG_SCHED_CASS
++#include "cass.c"
++
++/* Use CASS. A dummy wrapper ensures the replaced function is still "used". */
++static inline void *select_task_rq_fair_dummy(void)
++{
++	return (void *)select_task_rq_fair;
++}
++#define select_task_rq_fair cass_select_task_rq_fair
++#endif /* CONFIG_SCHED_CASS */
++
+ /*
+  * All the scheduling class methods:
+  */
