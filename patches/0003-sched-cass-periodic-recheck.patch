@@ -1,17 +1,7 @@
 diff -ruN a/kernel/sched/fair.c b/kernel/sched/fair.c
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -1061,6 +1061,9 @@
- #ifdef CONFIG_SMP
- 
- static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu);
-+#ifdef CONFIG_SCHED_CASS
-+static bool cass_recheck_dst(struct lb_env *env);
-+#endif
- static unsigned long task_h_load(struct task_struct *p);
- static unsigned long capacity_of(int cpu);
- 
-@@ -11391,6 +11394,145 @@
+@@ -11391,6 +11391,145 @@
  }
  
  /*
@@ -157,7 +147,7 @@ diff -ruN a/kernel/sched/fair.c b/kernel/sched/fair.c
   * Check this_cpu to ensure it is balanced within domain. Attempt to move
   * tasks if there is an imbalance.
   */
-@@ -11445,6 +11587,16 @@
+@@ -11445,6 +11584,16 @@
  	env.src_cpu = busiest->cpu;
  	env.src_rq = busiest;
  
