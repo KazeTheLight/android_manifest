@@ -6,131 +6,171 @@ diff -ruN a/kernel/sched/fair.c b/kernel/sched/fair.c
  
  static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu);
 +#ifdef CONFIG_SCHED_CASS
-+static int cass_select_idle_cpu(struct task_struct *p);
++static bool cass_recheck_dst(struct lb_env *env);
 +#endif
  static unsigned long task_h_load(struct task_struct *p);
  static unsigned long capacity_of(int cpu);
  
-@@ -7574,6 +7577,93 @@
- 	return true;
+@@ -11391,6 +11394,145 @@
  }
  
-+#ifdef CONFIG_SCHED_CASS
-+/*
+ /*
 + * CASS re-evaluation for the periodic load balancing path.
 + *
 + * cass_select_task_rq_fair() only runs on wakeup, so a task that has been
-+ * running (and whose relative utilisation has since drifted) is never
-+ * reconsidered by CASS. This hook lets the periodic balancer ask CASS which
-+ * CPU it would prefer, using the same relative-utilisation metric, so a
-+ * long-running task can be migrated to a better fitting CPU.
++ * running for a while -- and whose relative utilisation has since drifted --
++ * is never reconsidered by CASS. The periodic balancer only migrates towards
++ * the *busiest* group; it never asks whether the source runqueue is already
++ * over-committed relative to its own capacity.
 + *
-+ * Returns a CPU index, or -1 when CASS has no better candidate, in which
-+ * case the caller falls back to the stock selection path.
++ * This helper answers that question with the exact same metric as the wakeup
++ * path -- utilization relative to capacity -- so the two decisions cannot
++ * contradict each other. The decision is comparative: a destination is only
++ * worth moving to if it is relatively less loaded than the source by a clear
++ * margin, not merely if the source happens to be past its own ceiling. It reports a better
++ * destination for the current balancing pass, or false to let the stock
++ * selection stand.
++ *
++ * Note on the metric: utilisation is deliberately NOT clamped to capacity.
++ * Letting a ratio exceed SCHED_CAPACITY_SCALE is the whole point of CASS --
++ * a saturated little core must stay distinguishable from a saturated big one.
++ * Clamping would collapse exactly the distinction CASS exists to make.
 + */
-+static int cass_select_idle_cpu(struct task_struct *p)
++/* Only act on a source runqueue that is at least this relatively loaded. */
++#define CASS_RECHECK_MIN_LOAD	(SCHED_CAPACITY_SCALE / 2)
++
++/*
++ * How much relatively less loaded a destination must be to be worth moving
++ * to. One eighth of full scale: below this the difference is noise, and
++ * reacting to it just trades one ping-pong for another.
++ */
++#define CASS_RECHECK_SLACK	(SCHED_CAPACITY_SCALE / 8)
++
++#ifdef CONFIG_SCHED_CASS
++static bool cass_recheck_dst(struct lb_env *env)
 +{
-+	unsigned long task_util, util_min, util_max;
-+	unsigned long best_ratio = ~0UL, ratio;
-+	unsigned long this_util, this_cap, this_ratio;
-+	struct cpumask *cpus;
++	struct cpumask cpus;
++	unsigned long src_ratio, best_ratio = ~0UL;
++	unsigned long cap, util, ratio;
 +	int cpu, best_cpu = -1;
-+	struct rq *this_rq = this_rq();
 +
++	/* CASS is only meaningful on an asymmetric capacity setup. */
 +	if (!sched_asym_cpucap_active())
-+		return -1;
++		return false;
 +
-+	sync_entity_load_avg(&p->se);
-+	task_util = task_util_est(p);
-+	util_min = uclamp_eff_value(p, UCLAMP_MIN);
-+	util_max = uclamp_eff_value(p, UCLAMP_MAX);
++	/* CPU_NEWLY_IDLE fires far too often to afford a per-CPU scan. */
++	if (env->idle == CPU_NEWLY_IDLE)
++		return false;
 +
-+	/* Relative utilisation of the CPU the task is running on now. */
-+	this_cap = arch_scale_cpu_capacity(this_rq->cpu) - thermal_load_avg(this_rq);
-+	if (!this_cap)
-+		return -1;
-+	this_util = READ_ONCE(this_rq->cfs.avg.util_avg);
-+	if (this_util > this_cap)
-+		this_util = this_cap;
-+	this_ratio = div_u64(this_util << 10, this_cap);
++	cap = arch_scale_cpu_capacity(env->src_cpu) - thermal_load_avg(env->src_rq);
++	if (!cap)
++		return false;
++	util = READ_ONCE(env->src_rq->cfs.avg.util_avg);
++	src_ratio = div_u64(util * SCHED_CAPACITY_SCALE, cap);
 +
-+	cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
-+	cpumask_and(cpus, p->cpus_ptr, cpu_online_mask);
++	/*
++	 * Only reconsider a source that is meaningfully loaded.
++	 *
++	 * The threshold sits well BELOW full capacity on purpose. Requiring the
++	 * source to exceed 100% of its own capacity would mean waiting until the
++	 * runqueue is already saturated, but that is not the interesting case: the
++	 * interesting case is a little core sitting at ~70% of its capacity while
++	 * a big core is at ~28%. Comparing relative utilization -- not "has this
++	 * CPU passed its own ceiling" -- is what catches it.
++	 */
++	if (src_ratio <= CASS_RECHECK_MIN_LOAD)
++		return false;
 +
-+	for_each_cpu_wrap(cpu, cpus, this_rq->cpu) {
++	/*
++	 * A private cpumask on purpose. select_rq_mask is a shared per-CPU
++	 * buffer also used by the energy model and the NUMA path; reusing it
++	 * here would clobber the mask for whichever caller runs next.
++	 */
++	/*
++	 * env->dst_grpmask is group_balance_mask(sd->groups), i.e. the
++	 * destination group's CPU span. Staying inside it matters: the
++	 * imbalance was computed for this group, so handing the balancer a CPU
++	 * from another group would invalidate that computation.
++	 */
++	cpumask_and(&cpus, env->dst_grpmask, cpu_active_mask);
++
++	for_each_cpu_wrap(cpu, &cpus, env->dst_cpu) {
 +		struct rq *rq = cpu_rq(cpu);
-+		unsigned long cap, util;
 +
-+		/* Only consider CPUs that are actually idle, and that the
-+		 * task is allowed to run on.
-+		 */
-+		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
++		if (cpu == env->src_cpu)
 +			continue;
-+		if (!cpumask_test_cpu(cpu, p->cpus_ptr))
++		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
 +			continue;
 +
 +		/*
-+		 * Never move a task to a CPU that cannot hold it, otherwise
-+		 * the periodic balancer would undo what the wakeup path
-+		 * (and uclamp) carefully avoided.
++		 * Account for capacity lost to RT/DL work and IRQs, exactly as
++		 * cass_cpu_util() does, so both paths agree.
 +		 */
-+		if (util_fits_cpu(task_util, util_min, util_max, cpu) <= 0)
-+			continue;
-+
 +		cap = arch_scale_cpu_capacity(cpu) - thermal_load_avg(rq);
 +		if (!cap)
 +			continue;
++		cap -= min(cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq),
++			   cap - 1);
 +
 +		util = READ_ONCE(rq->cfs.avg.util_avg);
-+		if (util > cap)
-+			util = cap;
++		ratio = div_u64(util * SCHED_CAPACITY_SCALE, cap);
 +
-+		/* Same metric as the wakeup path: utilisation relative to
-+		 * capacity. Smaller is better.
++		/*
++		 * Require a real margin, not a rounding difference. A candidate has
++		 * to beat the source by CASS_RECHECK_SLACK, otherwise the two CPUs
++		 * trade the same task back and forth forever -- which is the very
++		 * behaviour this hook is supposed to prevent.
 +		 */
-+		ratio = div_u64(util << 10, cap);
-+		if (ratio >= this_ratio)
++		if (ratio + CASS_RECHECK_SLACK >= src_ratio)
++			continue;
++		if (ratio >= best_ratio)
 +			continue;
 +
-+		if (ratio < best_ratio) {
-+			best_ratio = ratio;
-+			best_cpu = cpu;
-+		}
++		best_ratio = ratio;
++		best_cpu = cpu;
 +	}
 +
-+	return best_cpu;
++	if (best_cpu < 0)
++		return false;
++
++	/*
++	 * Retarget the way the stock LBF_DST_PINNED path does: drop the old
++	 * destination from env->cpus so it is not reselected, then reset the
++	 * loop bookkeeping. Unlike stock we do not need to jump back to
++	 * "more_balance" -- this runs before any task has been moved, so the
++	 * caller simply carries on against the new destination. env->imbalance
++	 * stays slightly stale for this one pass, which is acceptable: the new
++	 * destination is idle by construction and the next pass recomputes it.
++	 */
++	__cpumask_clear_cpu(env->dst_cpu, env->cpus);
++	env->dst_rq = cpu_rq(best_cpu);
++	env->dst_cpu = best_cpu;
++	env->flags &= ~LBF_DST_PINNED;
++	env->loop = 0;
++	env->loop_break = SCHED_NR_MIGRATE_BREAK;
++
++	return true;
 +}
 +#endif /* CONFIG_SCHED_CASS */
 +
- /*
-  * Try and locate an idle core/thread in the LLC cache domain.
++/*
+  * Check this_cpu to ensure it is balanced within domain. Attempt to move
+  * tasks if there is an imbalance.
   */
-@@ -7583,6 +7673,9 @@
- 	struct sched_domain *sd;
- 	unsigned long task_util, util_min, util_max;
- 	int i, recent_used_cpu;
-+#ifdef CONFIG_SCHED_CASS
-+	int cass_cpu;
-+#endif
- 
- 	/*
- 	 * On asymmetric system, update task utilization because we will check
-@@ -7628,6 +7721,18 @@
- 		return prev;
- 	}
+@@ -11445,6 +11587,16 @@
+ 	env.src_cpu = busiest->cpu;
+ 	env.src_rq = busiest;
  
 +#ifdef CONFIG_SCHED_CASS
 +	/*
-+	 * Periodic re-evaluation: ask CASS whether another idle CPU would
-+	 * suit this task better than the ones considered below. Runs only on
-+	 * the load balancing path, not on wakeup, so the cost is bounded.
++	 * CASS re-evaluation: if the busiest queue is already over-committed
++	 * relative to its capacity, prefer an idle CPU that is relatively less
++	 * loaded. Only runs on the periodic balancing path, so the cost is
++	 * bounded by the balancing interval rather than the wakeup rate.
 +	 */
-+	cass_cpu = cass_select_idle_cpu(p);
-+	if (cass_cpu >= 0 && (available_idle_cpu(cass_cpu) ||
-+			      sched_idle_cpu(cass_cpu)))
-+		return cass_cpu;
++	cass_recheck_dst(&env);
 +#endif
 +
- 	/* Check a recently used CPU as a potential idle candidate: */
- 	recent_used_cpu = p->recent_used_cpu;
- 	p->recent_used_cpu = prev;
+ 	ld_moved = 0;
+ 	/* Clear this flag as soon as we find a pullable task */
+ 	env.flags |= LBF_ALL_PINNED;

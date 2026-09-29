@@ -1,0 +1,41 @@
+diff -ruN a/kernel/sched/cass.c b/kernel/sched/cass.c
+--- a/kernel/sched/cass.c
++++ b/kernel/sched/cass.c
+@@ -71,6 +71,28 @@
+ 		c->util -= min(c->util, task_util(current));
+ }
+ 
++/*
++ * Utilization expressed as a fraction of the CPU's *own* capacity, scaled
++ * to SCHED_CAPACITY_SCALE.
++ *
++ * Comparing raw util across CPUs of different capacity is not the same
++ * thing as comparing how loaded each CPU actually is. A little core at
++ * util 400 of 698 is 57% loaded; a big core at util 420 of 1024 is only
++ * 41% loaded. Raw util says "pick the little core", which is exactly
++ * backwards: the little core fills up first, then the task is pushed back
++ * to the big core, and the pair ping-pongs. Dividing by capacity is what
++ * makes CASS capacity aware, and skipping it here is why the little cores
++ * end up carrying more load than the big ones.
++ */
++static __always_inline
++unsigned long cass_cpu_rel_util(const struct cass_cpu_cand *c)
++{
++	if (unlikely(!c->cap))
++		return 0;
++
++	return c->util * SCHED_CAPACITY_SCALE / c->cap;
++}
++
+ /* Returns true if @a is a better CPU than @b */
+ static __always_inline
+ bool cass_cpu_better(const struct cass_cpu_cand *a,
+@@ -82,7 +104,7 @@
+ 	long res;
+ 
+ 	/* Prefer the CPU with lower relative utilization */
+-	if (cass_cmp(b->util, a->util))
++	if (cass_cmp(cass_cpu_rel_util(b), cass_cpu_rel_util(a)))
+ 		goto done;
+ 
+ 	/* Prefer the current CPU for sync wakes */
