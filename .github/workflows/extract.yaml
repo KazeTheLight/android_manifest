@@ -65,6 +65,22 @@ jobs:
           ls -la artifact.zip
           mkdir -p artifact-src
           unzip -q artifact.zip -d artifact-src
+
+      - name: Buka nested zip (artifact = .zip di dalam .zip)
+        run: |
+          set -euo pipefail
+          DEPTH=0
+          while [ "$DEPTH" -lt 5 ]; do
+            Z=$(find artifact-src -type f -name "*.zip" | head -1 || true)
+            [ -n "$Z" ] || break
+            DEPTH=$((DEPTH + 1))
+            DIR="$(dirname "$Z")/x${DEPTH}"
+            echo ">>> [$DEPTH] membuka $(basename "$Z") -> $DIR"
+            mkdir -p "$DIR"
+            unzip -q -o "$Z" -d "$DIR"
+            rm -f "$Z"
+          done
+          echo "=== tingkat bukaan: $DEPTH ==="
           echo "=== struktur (depth 3) ==="
           find artifact-src -maxdepth 3 | head -60
 
