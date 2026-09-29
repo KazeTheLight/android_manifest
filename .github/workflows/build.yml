@@ -179,6 +179,11 @@ jobs:
             fi
             echo "--- jejak klee ---"
             strings "$TMP" | grep -m3 -iE "klee" || echo "  (tidak ada)"
+            echo "--- scan marker ---"
+            for M in raccoon kernelnext susfs patchv; do
+              C=$(strings "$TMP" | grep -ic "$M" || true)
+              printf "  %-12s %s hit\n" "$M" "$C"
+            done
             rm -f "$TMP"
             echo
           done
