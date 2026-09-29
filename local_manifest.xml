@@ -19,7 +19,7 @@
         <linkfile src="kleaf/bazel.WORKSPACE" dest="WORKSPACE" />
     </project>
 
-    <project remote="klee-blobs" name="android_kernel-6.6" path="kernel-6.6" revision="bsp-klee-w-oss">
+    <project remote="klee-blobs" name="android_kernel-6.6" path="kernel-6.6" revision="android15-6.6-2025-09">
         <linkfile src="build.config.constants" dest="build.config.constants" />
     </project>
     <project remote="klee-blobs" name="android_kernel_device_modules-6.6" path="kernel_device_modules-6.6" revision="bsp-klee-w-oss">
