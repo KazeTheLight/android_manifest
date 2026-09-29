@@ -1,0 +1,136 @@
+diff -ruN a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1061,6 +1061,9 @@
+ #ifdef CONFIG_SMP
+ 
+ static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu);
++#ifdef CONFIG_SCHED_CASS
++static int cass_select_idle_cpu(struct task_struct *p);
++#endif
+ static unsigned long task_h_load(struct task_struct *p);
+ static unsigned long capacity_of(int cpu);
+ 
+@@ -7574,6 +7577,93 @@
+ 	return true;
+ }
+ 
++#ifdef CONFIG_SCHED_CASS
++/*
++ * CASS re-evaluation for the periodic load balancing path.
++ *
++ * cass_select_task_rq_fair() only runs on wakeup, so a task that has been
++ * running (and whose relative utilisation has since drifted) is never
++ * reconsidered by CASS. This hook lets the periodic balancer ask CASS which
++ * CPU it would prefer, using the same relative-utilisation metric, so a
++ * long-running task can be migrated to a better fitting CPU.
++ *
++ * Returns a CPU index, or -1 when CASS has no better candidate, in which
++ * case the caller falls back to the stock selection path.
++ */
++static int cass_select_idle_cpu(struct task_struct *p)
++{
++	unsigned long task_util, util_min, util_max;
++	unsigned long best_ratio = ~0UL, ratio;
++	unsigned long this_util, this_cap, this_ratio;
++	struct cpumask *cpus;
++	int cpu, best_cpu = -1;
++	struct rq *this_rq = this_rq();
++
++	if (!sched_asym_cpucap_active())
++		return -1;
++
++	sync_entity_load_avg(&p->se);
++	task_util = task_util_est(p);
++	util_min = uclamp_eff_value(p, UCLAMP_MIN);
++	util_max = uclamp_eff_value(p, UCLAMP_MAX);
++
++	/* Relative utilisation of the CPU the task is running on now. */
++	this_cap = arch_scale_cpu_capacity(this_rq->cpu) - thermal_load_avg(this_rq);
++	if (!this_cap)
++		return -1;
++	this_util = READ_ONCE(this_rq->cfs.avg.util_avg);
++	if (this_util > this_cap)
++		this_util = this_cap;
++	this_ratio = div_u64(this_util << 10, this_cap);
++
++	cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
++	cpumask_and(cpus, p->cpus_ptr, cpu_online_mask);
++
++	for_each_cpu_wrap(cpu, cpus, this_rq->cpu) {
++		struct rq *rq = cpu_rq(cpu);
++		unsigned long cap, util;
++
++		/* Only consider CPUs that are actually idle, and that the
++		 * task is allowed to run on.
++		 */
++		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
++			continue;
++		if (!cpumask_test_cpu(cpu, p->cpus_ptr))
++			continue;
++
++		/*
++		 * Never move a task to a CPU that cannot hold it, otherwise
++		 * the periodic balancer would undo what the wakeup path
++		 * (and uclamp) carefully avoided.
++		 */
++		if (util_fits_cpu(task_util, util_min, util_max, cpu) <= 0)
++			continue;
++
++		cap = arch_scale_cpu_capacity(cpu) - thermal_load_avg(rq);
++		if (!cap)
++			continue;
++
++		util = READ_ONCE(rq->cfs.avg.util_avg);
++		if (util > cap)
++			util = cap;
++
++		/* Same metric as the wakeup path: utilisation relative to
++		 * capacity. Smaller is better.
++		 */
++		ratio = div_u64(util << 10, cap);
++		if (ratio >= this_ratio)
++			continue;
++
++		if (ratio < best_ratio) {
++			best_ratio = ratio;
++			best_cpu = cpu;
++		}
++	}
++
++	return best_cpu;
++}
++#endif /* CONFIG_SCHED_CASS */
++
+ /*
+  * Try and locate an idle core/thread in the LLC cache domain.
+  */
+@@ -7583,6 +7673,9 @@
+ 	struct sched_domain *sd;
+ 	unsigned long task_util, util_min, util_max;
+ 	int i, recent_used_cpu;
++#ifdef CONFIG_SCHED_CASS
++	int cass_cpu;
++#endif
+ 
+ 	/*
+ 	 * On asymmetric system, update task utilization because we will check
+@@ -7628,6 +7721,18 @@
+ 		return prev;
+ 	}
+ 
++#ifdef CONFIG_SCHED_CASS
++	/*
++	 * Periodic re-evaluation: ask CASS whether another idle CPU would
++	 * suit this task better than the ones considered below. Runs only on
++	 * the load balancing path, not on wakeup, so the cost is bounded.
++	 */
++	cass_cpu = cass_select_idle_cpu(p);
++	if (cass_cpu >= 0 && (available_idle_cpu(cass_cpu) ||
++			      sched_idle_cpu(cass_cpu)))
++		return cass_cpu;
++#endif
++
+ 	/* Check a recently used CPU as a potential idle candidate: */
+ 	recent_used_cpu = p->recent_used_cpu;
+ 	p->recent_used_cpu = prev;
