@@ -6,7 +6,7 @@ on:
 env:
   KERNEL_MANIFEST_URL: https://android.googlesource.com/kernel/manifest
   KERNEL_MANIFEST_BRANCH: common-android15-6.6-2025-09
-  LOCAL_MANIFEST_REPO: https://github.com/xiaomi-klee-devs/android_manifest
+  LOCAL_MANIFEST_REPO: https://github.com/KazeTheLight/android_manifest
 
 jobs:
   prepare:
