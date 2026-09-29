@@ -1,0 +1,98 @@
+name: Extract Image from Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID sumber (artifact kernel ada di sini)'
+        required: true
+        default: '36551268265'
+      artifact_name:
+        description: 'Nama artifact'
+        required: true
+        default: 'kernel-202609291645'
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact dari run sebelumnya
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: artifact-src
+
+      - name: Petakan struktur artifact
+        run: |
+          cd artifact-src
+          echo "=== ukuran total ==="
+          du -sh .
+          echo
+          echo "=== struktur (depth 3, 80 baris) ==="
+          find . -maxdepth 3 | head -80
+
+      - name: Temukan Image
+        run: |
+          cd artifact-src
+          echo "=== semua kandidat ==="
+          find . \( -name "Image" -o -name "Image.*" -o -name "Image-*" -o -name "vmlinux" \) \
+            -type f -printf "%s\t%p\n" | sort -rn | head -20
+
+      - name: Salin Image ke artifact kecil
+        run: |
+          set -euo pipefail
+          cd artifact-src
+          IMG=$(find . -type f \( -name "Image" -o -name "Image.*" -o -name "Image-*" \) \
+                ! -name "*.dtb" -printf "%s\t%p\n" | sort -rn | head -1 | cut -f2-)
+          if [ -z "$IMG" ]; then
+            echo "ERROR: tidak ada file Image"
+            find . -maxdepth 4 -type d | head -40
+            exit 1
+          fi
+          echo "=== IMAGE: $IMG ==="
+          ls -la "$IMG"
+          echo
+          echo "=== tipe file ==="
+          file "$IMG" || true
+          echo
+          echo "=== sha256 ==="
+          sha256sum "$IMG"
+          echo
+          mkdir -p ../out
+          cp "$IMG" ../out/
+          cp "$IMG" "../out/$(basename "$IMG").$(date +%Y%m%d%H%M)" 2>/dev/null || true
+          echo
+          echo "=== isi out/ ==="
+          ls -la ../out/
+
+      - name: Laporkan versi kernel dari dalam Image
+        run: |
+          set -euo pipefail
+          for f in out/*; do
+            [ -f "$f" ] || continue
+            echo "### $f"
+            echo "--- header 32 byte (hex) ---"
+            xxd -l 32 "$f" || true
+            echo "--- uncompress lalu cari version string ---"
+            TMP=$(mktemp)
+            case "$f" in
+              *.gz)  gunzip -c  "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
+              *.lz4) lz4 -d -c "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
+              *.xz)  xz -dc   "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
+              *)     cp "$f" "$TMP" ;;
+            esac
+            strings "$TMP" | grep -m3 -E "Linux version [0-9]" || echo "  (tidak ada version string di uncompressed)"
+            strings "$TMP" | grep -m1 -E "android1[5-9]|klee" || true
+            rm -f "$TMP"
+            echo
+          done
+
+      - name: Upload Image (kecil)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
