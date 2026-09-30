@@ -30,11 +30,18 @@ env:
   DMDIR: kernel_device_modules-6.6
   # Bump nilai ini untuk memaksa cache objek git dibangun ulang dari nol.
   REPO_CACHE_VERSION: '3'
-  # Bump nilai ini bila format cache out/ berubah atau perlu clean slate.
-  # Bump juga sekali lagi setelah migrasi ke kunci berbasis-isi-file, supaya
-  # cache lama yang kuncinya berbasis hashFiles(patches/**) tidak pernah
-  # terbaca dan tidak memenuhi kuota repo tanpa pernah dipakai.
-  OUT_CACHE_VERSION: '2'
+  # Bump nilai ini hanya bila format cache out/ benar-benar berubah.
+  #
+  # Sengaja TIDAK dinaikkan untuk migrasi ke kunci berbasis-isi-file. Kalau
+  # dinaikkan, prefix restore-keys ikut berubah dan cache yang baru saja
+  # disimpan run sebelumnya tidak akan pernah bisa ditangkap lagi, artinya
+  # satu build penuh terbuang percuma.
+  #
+  # Kunci exact match tetap membedakan skema lama dan baru karena nilai
+  # hash-nya beda format. Cache skema lama hanya bisa(match) lewat
+  # restore-keys prefix, yaitu sebagai restore parsial, bukan sebagai cache
+  # final yang disimpan ulang dengan kunci itu.
+  OUT_CACHE_VERSION: '1'
   # Daftar file yang disentuh patch. Diisi oleh langkah "Terapkan patch", lalu
   # dipakai untuk menghitung kunci cache dari isi file, bukan nama file patch.
   PATCHED_FILES: /tmp/patched_files.txt
