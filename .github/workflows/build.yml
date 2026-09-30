@@ -296,6 +296,10 @@ jobs:
           REPO: ${{ github.repository }}
           RUNNER_OS: ${{ runner.os }}
           OUT_VER: ${{ env.OUT_CACHE_VERSION }}
+          # Wajib ada di sini: skrip berjalan dengan set -u, dan langkah ini
+          # memakai $REUSE_RUN. Kalau hanya ada di env job create_release,
+          # runner gagal dengan "REUSE_RUN: unbound variable".
+          REUSE_RUN: ${{ inputs.reuse_run }}
         run: |
           set -euo pipefail
 
