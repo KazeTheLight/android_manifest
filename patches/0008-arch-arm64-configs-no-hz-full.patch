@@ -1,0 +1,25 @@
+K-One-Kernel: aktifkan CONFIG_NO_HZ_FULL untuk big core
+
+NO_HZ_IDLE hanya menghentikan tick saat seluruh CPU idle. NO_HZ_FULL
+mampu menghentikan tick pada CPU tertentu secara permanen sehingga core
+tersebut tidak perlu wakeup hanya untuk sched clock.
+
+Targetnya adalah cluster big (cpu4-7) karena core therein paling mahal
+energi dan paling sering terbangun. CPU tersebut diisolasi lewat argumen
+boot nohz_full=4-7 yang ditambahkan melalui anykernel.sh.
+
+CONFIG_CPU_ISOLATION sudah aktif di gki_defconfig sehingga tidak perlu
+diubah.
+--- a/arch/arm64/configs/gki_defconfig
++++ b/arch/arm64/configs/gki_defconfig
+@@ -55,8 +55,8 @@
+ CONFIG_TICK_ONESHOT=y
+ CONFIG_NO_HZ_COMMON=y
+ # CONFIG_HZ_PERIODIC is not set
+-CONFIG_NO_HZ_IDLE=y
+-# CONFIG_NO_HZ_FULL is not set
++# CONFIG_NO_HZ_IDLE is not set
++CONFIG_NO_HZ_FULL=y
+ CONFIG_NO_HZ=y
+ CONFIG_HIGH_RES_TIMERS=y
+ # end of Timers subsystem
