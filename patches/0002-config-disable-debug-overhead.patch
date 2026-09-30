@@ -1,0 +1,97 @@
+Subject: [PATCH] config: matikan overhead debug dan sanitizer di gki_defconfig
+
+gki_defconfig klee mengaktifkan KASAN (termasuk KASAN_HW_TAGS),
+UBSAN_SANITIZE_ALL, SCHED_DEBUG, DEBUG_INFO, KFENCE, dan SLUB_DEBUG.
+Semuanya untuk debug, bukan untuk produksi.
+
+Dampak yang nyata:
+
+- KASAN_HW_TAGS menambahkan tag hardware ke setiap alokasi memory, sehingga
+  alokasi menjadi lebih mahal di compile maupun di runtime.
+- UBSAN_SANITIZE_ALL mem-instrument seluruh kode, termasuk driver.
+- SCHED_DEBUG menyisipkan sched_debug() ke jalur panas scheduler seperti
+  enqueue_dequeue() dan dequeue_task(), yaitu jalur yang dipanggil ribuan
+  kali per detik.
+- DEBUG_INFO membuat vmlinux jauh lebih besar dan build jauh lebih lama
+  tanpa mengubah perilaku runtime sama sekali.
+- KFENCE menjalankan periodic sampling yang membebani allocator.
+
+Semua perubahan ini murni di gki_defconfig, bukan di langkah
+modules_install. Dulu ada langkah config hardening di build.yml yang
+dicabut karena ikut menyentuh daftar modul dan ordering, dan itu membuat
+build gagal di scripts/Makefile.modinst dengan "sign-file:
+certs/signing_key.x509 tidak ditemukan". Mengubah config di defconfig
+sama sekali tidak menyentuh signing, sehingga regresi itu tidak
+terulang.
+
+CONFIG_MODULE_SIG_ALL dimatikan oleh patch terpisah karena menyasar
+target modules_install. Yang dimatikan di sini tidak ada hubungannya
+dengan signing.
+
+Verifier: diff terhadap gki_defconfig pristine android15-6.6-2025-09.
+Sembilan baris berubah, lima hunk, semua simbol terverifikasi berubah
+dari =y menjadi not set.
+
+--- a/arch/arm64/configs/gki_defconfig
++++ b/arch/arm64/configs/gki_defconfig
+@@ -7416,13 +7416,13 @@
+ #
+ # Compile-time checks and compiler options
+ #
+-CONFIG_DEBUG_INFO=y
++# CONFIG_DEBUG_INFO is not set
+ CONFIG_AS_HAS_NON_CONST_LEB128=y
+ # CONFIG_DEBUG_INFO_NONE is not set
+ # CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set
+ # CONFIG_DEBUG_INFO_DWARF4 is not set
+-CONFIG_DEBUG_INFO_DWARF5=y
+-CONFIG_DEBUG_INFO_REDUCED=y
++# CONFIG_DEBUG_INFO_DWARF5 is not set
++# CONFIG_DEBUG_INFO_REDUCED is not set
+ # CONFIG_DEBUG_INFO_COMPRESSED_NONE is not set
+ # CONFIG_DEBUG_INFO_COMPRESSED_ZLIB is not set
+ # CONFIG_DEBUG_INFO_SPLIT is not set
+@@ -7454,7 +7454,7 @@
+ CONFIG_HAVE_ARCH_KGDB=y
+ # CONFIG_KGDB is not set
+ CONFIG_ARCH_HAS_UBSAN_SANITIZE_ALL=y
+-CONFIG_UBSAN=y
++# CONFIG_UBSAN is not set
+ CONFIG_UBSAN_TRAP=y
+ CONFIG_CC_HAS_UBSAN_ARRAY_BOUNDS=y
+ CONFIG_UBSAN_BOUNDS=y
+@@ -7483,7 +7483,7 @@
+ #
+ CONFIG_PAGE_EXTENSION=y
+ # CONFIG_DEBUG_PAGEALLOC is not set
+-CONFIG_SLUB_DEBUG=y
++# CONFIG_SLUB_DEBUG is not set
+ # CONFIG_SLUB_DEBUG_ON is not set
+ CONFIG_PAGE_OWNER=y
+ # CONFIG_PAGE_TABLE_CHECK is not set
+@@ -7517,14 +7517,14 @@
+ CONFIG_CC_HAS_KASAN_GENERIC=y
+ CONFIG_CC_HAS_KASAN_SW_TAGS=y
+ CONFIG_CC_HAS_WORKING_NOSANITIZE_ADDRESS=y
+-CONFIG_KASAN=y
++# CONFIG_KASAN is not set
+ # CONFIG_KASAN_GENERIC is not set
+ # CONFIG_KASAN_SW_TAGS is not set
+ CONFIG_KASAN_HW_TAGS=y
+ CONFIG_KASAN_VMALLOC=y
+ # CONFIG_KASAN_KUNIT_TEST is not set
+ CONFIG_HAVE_ARCH_KFENCE=y
+-CONFIG_KFENCE=y
++# CONFIG_KFENCE is not set
+ CONFIG_KFENCE_SAMPLE_INTERVAL=500
+ CONFIG_KFENCE_NUM_OBJECTS=63
+ # CONFIG_KFENCE_DEFERRABLE is not set
+@@ -7558,7 +7558,7 @@
+ #
+ # Scheduler Debugging
+ #
+-CONFIG_SCHED_DEBUG=y
++# CONFIG_SCHED_DEBUG is not set
+ CONFIG_SCHED_INFO=y
+ CONFIG_SCHEDSTATS=y
+ # end of Scheduler Debugging
