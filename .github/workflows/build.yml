@@ -7,140 +7,406 @@ on:
         description: 'Buat artifact lengkap (~900MB)? false = hanya Image kecil'
         type: boolean
         default: false
+      use_cache:
+        description: 'Pakai cache objek git repo? (hemat sync, boros kuota cache)'
+        type: boolean
+        default: true
+      reuse_run:
+        description: >-
+          Pakai out/ dari run ini sebagai titik awal (contoh: 36686083392), lalu
+          build ulang. Hanya bagian yang berubah yang dikompilasi. Harus branch
+          yang sama, karena cache out/ tidak bisa dibaca lintas branch. Kosongkan
+          untuk build biasa.
+        type: string
+        default: ''
+      reuse_dirty:
+        description: >-
+          Tandai release ini belum terverifikasi boot di perangkat. Ditulis di
+          judul dan notes supaya tidak tertukar dengan build yang sudah di-flash.
+        type: boolean
+        default: false
+
+# Serialisasi run: dispatch kedua menunggu, tidak membatalkan build 40 menit yang
+# sedang jalan. Naikkan ke true bila kamu memang ingin run terbaru mengalahkan
+# run lama.
+concurrency:
+  group: kok-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   KERNEL_MANIFEST_URL: https://android.googlesource.com/kernel/manifest
   KERNEL_MANIFEST_BRANCH: common-android15-6.6-2025-09
   LOCAL_MANIFEST_REPO: https://github.com/KazeTheLight/android_manifest
+  KDIR: kernel-6.6
+  DMDIR: kernel_device_modules-6.6
+  # Bump nilai ini untuk memaksa cache objek git dibangun ulang dari nol.
+  REPO_CACHE_VERSION: '3'
+  # Bump nilai ini hanya bila format cache out/ benar-benar berubah.
+  #
+  # Sengaja TIDAK dinaikkan untuk migrasi ke kunci berbasis-isi-file. Kalau
+  # dinaikkan, prefix restore-keys ikut berubah dan cache yang baru saja
+  # disimpan run sebelumnya tidak akan pernah bisa ditangkap lagi, artinya
+  # satu build penuh terbuang percuma.
+  #
+  # Kunci exact match tetap membedakan skema lama dan baru karena nilai
+  # hash-nya beda format. Cache skema lama hanya bisa(match) lewat
+  # restore-keys prefix, yaitu sebagai restore parsial, bukan sebagai cache
+  # final yang disimpan ulang dengan kunci itu.
+  OUT_CACHE_VERSION: '1'
+  # Daftar file yang disentuh patch. Diisi oleh langkah "Terapkan patch", lalu
+  # dipakai untuk menghitung kunci cache dari isi file, bukan nama file patch.
+  PATCHED_FILES: /tmp/patched_files.txt
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      date: ${{ steps.setdate.outputs.date }}
-    steps:
-      - name: Generate build date
-        id: setdate
-        run: echo "date=$(TZ=Asia/Jakarta date +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
-
   build_kernel:
     name: Build Kernel
     runs-on: ubuntu-latest
-    needs: prepare
+    timeout-minutes: 150
+    outputs:
+      date: ${{ steps.setdate.outputs.date }}
+      version: ${{ steps.report.outputs.version }}
     env:
-      DATE: ${{ needs.prepare.outputs.date }}
+      ARTIFACT: ${{ github.workspace }}/artifact
+      IMGOUT: ${{ github.workspace }}/image-out
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set environment
+      - name: Generate build date
+        id: setdate
         run: |
-          echo "ARTIFACT=$GITHUB_WORKSPACE/artifact" >> "$GITHUB_ENV"
-          echo "IMGOUT=$GITHUB_WORKSPACE/image-out" >> "$GITHUB_ENV"
+          set -euo pipefail
+          d="$(TZ=Asia/Jakarta date +%Y%m%d%H%M)"
+          echo "date=$d" >> "$GITHUB_OUTPUT"
+          #_step output tidak bisa dibaca sebagai env.DATE di step lain, jadi
+          # taruh juga ke environment agar nama artifact konsisten.
+          echo "DATE=$d" >> "$GITHUB_ENV"
 
       - name: Install tools
         run: |
+          set -euo pipefail
           mkdir -p ~/.bin
-          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          # -f: gagal kalau HTTP error, -L: ikuti redirect, -S: tampilkan error.
+          # Tanpa ini, halaman error GitHub bisa tersimpan sebagai "repo".
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/.bin/repo
           chmod a+x ~/.bin/repo
+          # Launcher repo adalah skrip Python yang diawali "#!". Cek ini
+          # menangkap halaman error yang lolos dari -f, misalnya proxy yang
+          # membalas 200 dengan HTML. Jangan cari teks "repo": 64 byte pertama
+          # tidak memuat kata itu sama sekali.
+          [ -s ~/.bin/repo ] \
+            || { echo "::error::repo launcher kosong"; exit 1; }
+          head -c 2 ~/.bin/repo | grep -q '#!' \
+            || { echo "::error::repo launcher bukan skrip yang bisa dijalankan"; exit 1; }
+          ~/.bin/repo --version >/dev/null
           echo "$HOME/.bin" >> "$GITHUB_PATH"
-          sudo apt-get update -y
-          sudo apt-get install -y device-tree-compiler python3 lz4
 
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            device-tree-compiler python3 lz4 zip unzip
+
+      - name: Restore cache objek git
+        if: inputs.use_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .repo/project-objects
+            .repo/projects
+          key: kok-repo-${{ runner.os }}-${{ env.REPO_CACHE_VERSION }}-${{ env.KERNEL_MANIFEST_BRANCH }}-${{ hashFiles('local_manifest.xml') }}
+          restore-keys: |
+            kok-repo-${{ runner.os }}-${{ env.REPO_CACHE_VERSION }}-${{ env.KERNEL_MANIFEST_BRANCH }}-
+
+      # Cache output build sengaja dipindahkan ke setelah patch, bukan sebelum.
+      # Kuncinya dihitung dari isi file HASIL patch, jadi repo harus sudah
+      # di-patch dulu. Kunci lama memakai hashFiles('patches/**'), yang membuat
+      # rename atau renumber patch membatalkan cache meski output kernel identik.
       - name: Sync kernel source
+
         run: |
+          set -euo pipefail
           repo init -u "$KERNEL_MANIFEST_URL" -b "$KERNEL_MANIFEST_BRANCH" --depth=1
-          git clone "$LOCAL_MANIFEST_REPO" .repo/local_manifests
-          repo sync --force-sync --no-clone-bundle --no-tags -j"$(nproc --all)"
+          git clone --depth=1 "$LOCAL_MANIFEST_REPO" .repo/local_manifests
+          # --optimized-fetch memakai objek yang sudah ada di cache dan hanya
+          # menarik yang kurang. --force-sync sengaja dihapus: workspace selalu
+          # kosong, jadi checkout ulang tidak memberi manfaat dan hanya lambat.
+          repo sync -j"$(nproc --all)" --no-clone-bundle --no-tags \
+            --optimized-fetch --fail-fast
+          for d in "$KDIR" "$DMDIR"; do
+            [ -d "$d" ] || { echo "::error::$d tidak ada setelah sync"; exit 1; }
+          done
 
       - name: Terapkan patch K-One-Kernel
         run: |
           set -euo pipefail
           shopt -s nullglob
-          PATCHES=(patches/*.patch)
-          if [ ${#PATCHES[@]} -eq 0 ]; then
-            echo "::error:: tidak ada patch di patches/*.patch"; exit 1
-          fi
-          for p in "${PATCHES[@]}"; do
-            echo "=== applying $p ==="
-            patch -p1 -d kernel-6.6 --forward --no-backup-if-mismatch < "$p"
-          done
+
+          # apply_patches <tree> <direktori patch> <required|optional>
+          apply_patches() {
+            local tree="$1" dir="$2" mode="$3"
+            local -a found=( "$dir"/*.patch )
+            if [ ${#found[@]} -eq 0 ]; then
+              if [ "$mode" = required ]; then
+                echo "::error::tidak ada patch di $dir/*.patch"; exit 1
+              fi
+              echo "::notice::tidak ada patch di $dir, langkah dilewati"
+              return 0
+            fi
+            [ -d "$tree" ] || { echo "::error::$tree tidak ada di workspace"; exit 1; }
+            for p in "${found[@]}"; do
+              echo "--- $p -> $tree"
+              # --batch: jangan pernah interaktif. Tanpa itu `patch` meminta
+              # "File to patch:" dan di runner tanpa TTY bisa menelan sisa patch
+              # sebagai jawaban lalu exit 0 tanpa Apply patch sama sekali.
+              # --reject-file=-: tolak ditulis ke log, bukan file .rej di tree.
+              patch -p1 -d "$tree" --forward --batch --no-backup-if-mismatch \
+                --reject-file=- < "$p"
+              # Catat file yang disentuh. Daftar ini dipakai langkah "Hitung
+              # kunci cache" supaya kunci cache berbasis isi file hasil patch,
+              # bukan nama file patch. Kalau tidak, me-rename atau me-reorder
+              # patch membatalkan cache padahal output kernel identik.
+              grep -E '^\+\+\+ b/' "$p" | sed 's|^+++ b/||' >> "$PATCHED_FILES"
+            done
+            # Periksa sisa .rej sebagai jaring pengaman tambahan: dengan
+            # --forward, patch yang sudah ter-apply dilewati dan patch yang
+            # tidak cocok bisa lolos tanpa terlihat di ringkasan. Tree CI selalu
+            # bersih karena hanya .repo yang di-cache, bukan worktree.
+            local rej
+            rej=$(find "$tree" -name '*.rej' -print -quit)
+            if [ -n "$rej" ]; then
+              echo "::error::patch ditolak, ditemukan:"
+              find "$tree" -name '*.rej' -print
+              exit 1
+            fi
+          }
+
+          : > "$PATCHED_FILES"
+          apply_patches "$KDIR" patches required
+          apply_patches "$DMDIR" patches-modules optional
 
           echo
           echo "=== verifikasi hasil patch ==="
-          grep -n '^NAME = ' kernel-6.6/Makefile
-          grep -n '^CONFIG_LOCALVERSION' kernel-6.6/arch/arm64/configs/gki_defconfig
-          if ! grep -q '^CONFIG_LOCALVERSION="-K-One-Kernel"$' kernel-6.6/arch/arm64/configs/gki_defconfig; then
-            echo "::error:: CONFIG_LOCALVERSION tidak sesuai harapan setelah patch"; exit 1
+          grep -n '^NAME = ' "$KDIR/Makefile"
+          if ! grep -q '^CONFIG_LOCALVERSION="-K-One-Kernel"$' \
+               "$KDIR/arch/arm64/configs/gki_defconfig"; then
+            echo "::error::CONFIG_LOCALVERSION tidak sesuai harapan setelah patch"
+            exit 1
           fi
-          echo
+          grep -n '^CONFIG_LOCALVERSION' "$KDIR/arch/arm64/configs/gki_defconfig"
           echo "::notice title=Localversion::diharapkan uname -r = 6.6.89-android15-8-maybe-dirty-K-One-Kernel"
 
       - name: Hapus KernelSU
         run: |
           set -euo pipefail
-          KDIR=kernel-6.6
           DEFCONFIG="$KDIR/arch/arm64/configs/gki_defconfig"
 
           echo "=== CONFIG_KSU sebelum ==="
           grep -n 'CONFIG_KSU' "$DEFCONFIG" || echo "  (tidak ada)"
 
-          # 1) Matikan config di defconfig GKI
           sed -i 's/^CONFIG_KSU=y$/# CONFIG_KSU is not set/' "$DEFCONFIG"
-
-          # 2) Putuskan titik integrasi Kbuild/Kconfig
           sed -i '/kernelsu/d' "$KDIR/drivers/Kconfig" "$KDIR/drivers/Makefile"
-
-          # 3) Buang sumbernya
           rm -rf "$KDIR/drivers/kernelsu"
 
           echo
           echo "=== verifikasi ==="
           if grep -qE '^CONFIG_KSU' "$DEFCONFIG"; then
-            echo "::error:: CONFIG_KSU masih aktif di defconfig"; exit 1
+            echo "::error::CONFIG_KSU masih aktif di defconfig"; exit 1
           fi
           if grep -n 'kernelsu' "$KDIR/drivers/Kconfig" "$KDIR/drivers/Makefile"; then
-            echo "::error:: masih ada referensi kernelsu di Kconfig/Makefile"; exit 1
+            echo "::error::masih ada referensi kernelsu di Kconfig/Makefile"; exit 1
           fi
           if [ -d "$KDIR/drivers/kernelsu" ]; then
-            echo "::error:: folder drivers/kernelsu masih ada"; exit 1
+            echo "::error::folder drivers/kernelsu masih ada"; exit 1
           fi
-          echo "  CONFIG_KSU   -> $(grep -m1 'CONFIG_KSU' "$DEFCONFIG" || echo '(tidak ada sama sekali)')"
-          echo "  drivers/kernelsu -> terhapus"
           echo "OK: KernelSU dibuang dari tree"
+
+      # Kunci cache dihitung dari isi file yang benar-benar berubah, bukan dari
+      # hashFiles('patches/**'). Alasannya: output kernel ditentukan oleh isi
+      # akhir file, bukan oleh nama atau urutan file patch. Dengan kunci lama,
+      # me-rename atau me-reorder patch membatalkan cache meski kernel yang
+      # dihasilkan identik.
+      #
+      # KernelSU removal di atas juga mengubah file, jadi kunci harus dihitung
+      # setelah langkah itu, bukan setelah patch saja.
+      - name: Hitung kunci cache
+        id: cachekey
+        run: |
+          set -euo pipefail
+          echo "=== file yang disentuh patch ==="
+          sort -u "$PATCHED_FILES" | tee /dev/stderr | wc -l
+
+          # Hash isi file, bukan path-nya. Patch yang menyentuh file berbeda tapi
+          # menghasilkan isi identik akan menghasilkan kunci sama, yang memang
+          # benar karena output build-nya sama.
+          HASH_INPUT=$(mktemp)
+          while read -r f; do
+            [ -n "$f" ] || continue
+            for tree in "$KDIR" "$DMDIR"; do
+              if [ -f "$tree/$f" ]; then
+                { printf '%s\0' "$f"; cat "$tree/$f"; } >> "$HASH_INPUT"
+              fi
+            done
+          done < <(sort -u "$PATCHED_FILES")
+          HASH=$(sha256sum "$HASH_INPUT" | cut -c1-32)
+          rm -f "$HASH_INPUT"
+
+          # local_manifest.xml menentukan tag sumber upstream, jadi tetap masuk.
+          MHASH=$(sha256sum local_manifest.xml | cut -c1-16)
+          echo "kunci cache out: $MHASH-$HASH"
+          echo "key=$MHASH-$HASH" >> "$GITHUB_OUTPUT"
+
+      # Cache output build. Ini penghematan terbesar: saat repo dan isi file
+      # hasil patch tidak berubah, Bazel bisa melewati sebagian besar compile.
+      #
+      # Inputs reuse_run mengubah asal cache: bukan lagi "cocokkan dengan isi
+      # patch saat ini", melainkan pakai out/ dari run yang disebut. Itu yang
+      # membuat bisa iterasi di atas build lama tanpa compile dari nol.
+      - name: Restore cache output build
+        if: inputs.use_cache && inputs.reuse_run == ''
+        uses: actions/cache@v4
+        with:
+          path: |
+            out
+            ${{ runner.temp }}/bazel_disk_cache
+          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ steps.cachekey.outputs.key }}
+          restore-keys: |
+            kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-
+
+      # Cache out/ milik run lain. Dipisah dari langkah di atas karena kunci
+      # cache harus dibaca dari log run asal, sedangkan kunci di atas dihitung
+      # ulang di run ini.
+      #
+      # Langkah "Restore cache output build" sengaja dimatikan saat reuse_run
+      # diisi: keduanya menulis ke out/, dan yangrestore belakangan menimpa yang
+      # pertama. restore-keys di bawah juga sengaja dibiarkan kosong; memakai
+      # prefix kok-out- yang longgar bisa menarik out/ dari run yang tidak
+      # diminta, dan hasil restore yang diam-diam berbeda lebih buruk daripada
+      # build dari nol.
+      - name: Restore out dari run sebelumnya
+        if: inputs.use_cache && inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUNNER_OS: ${{ runner.os }}
+          OUT_VER: ${{ env.OUT_CACHE_VERSION }}
+          # Wajib ada di sini: skrip berjalan dengan set -u, dan langkah ini
+          # memakai $REUSE_RUN. Kalau hanya ada di env job create_release,
+          # runner gagal dengan "REUSE_RUN: unbound variable".
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          set -euo pipefail
+
+          # actions/cache tidak bisa restore berdasarkan run-id secara langsung,
+          # jadi kunci cache yang disimpan run asal dibaca dari log-nya, lalu
+          # dipakai sebagai kunci restore.
+          #
+          # runner.os adalah placeholder milik GitHub Actions, tidak tersedia
+          # sebagai variabel shell, jadi dikirim lewat env RUNNER_OS.
+          # Panjang hash tidak diasumsikan: kunci cache bisa berubah bentuk saat
+          # algoritma kuncinya diubah, jadi yang dicocokkan hanya prefix
+          # kok-out-<os>-<versi>- diikuti hex.
+          KEY=$(gh run view "$REUSE_RUN" --repo "$REPO" --log 2>/dev/null \
+            | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -oE "kok-out-${RUNNER_OS}-${OUT_VER}-[0-9a-f]{8,}" \
+            | grep -vE '[.,;]$' \
+            | sort -u | head -1 || true)
+          if [ -z "$KEY" ]; then
+            echo "::warning::run ${REUSE_RUN} tidak menyimpan cache out/, build dari nol"
+            exit 0
+          fi
+          echo "  kunci cache asal: ${KEY}"
+
+          # Cache hanya bisa dibaca pada branch yang sama dengan tempat ia
+          # disimpan. Melewati branch di sini akan diam-diam menghasilkan
+          # build dari nol, jadi lebih baik gagal dengan pesan yang jelas.
+          CACHE_REF=$(gh api "repos/${REPO}/actions/caches?key=${KEY}" \
+            -q '.actions_caches[0].ref // empty')
+          if [ -z "$CACHE_REF" ]; then
+            echo "::error::cache ${KEY} tidak ada di repo ini (mungkin sudah kedaluwarsa)"
+            exit 1
+          fi
+          CURRENT_REF="refs/heads/${GITHUB_REF_NAME}"
+          if [ "$CACHE_REF" != "$CURRENT_REF" ]; then
+            echo "::error::cache ${KEY} ada di ${CACHE_REF}, sekarang di ${CURRENT_REF}"
+            echo "::error::cache tidak bisa lintas branch, jalankan dari branch yang sama"
+            exit 1
+          fi
+          # Nilai $GITHUB_OUTPUT tidak boleh diawali spasi: runner menolak dengan
+          # "Invalid format". Spasi hanya untuk tampilan log, jadi ditulis ke
+          # stdout, bukan ke file output.
+          echo "cache_key=${KEY}" >> "$GITHUB_OUTPUT"
+        id: reusekey
+
+      # Memakai actions/cache/restore, bukan actions/cache, supaya tidak ada
+      # langkah simpan yang menimpa cache asli milik run asal. Run ini hanya
+      # membaca turunan yang sudah ada.
+      - name: Pakai out dari run sebelumnya
+        if: inputs.use_cache && inputs.reuse_run != '' && steps.reusekey.outputs.cache_key != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            out
+            ${{ runner.temp }}/bazel_disk_cache
+          key: ${{ steps.reusekey.outputs.cache_key }}
+          restore-keys: |
+            ${{ steps.reusekey.outputs.cache_key }}
 
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Build kernel
-        run: ./kernel_device_modules-6.6/build.sh
-
-      - name: Petakan hasil build
         run: |
           set -euo pipefail
+          CPU=$(nproc --all)
+          echo "  CPU terdeteksi : ${CPU}"
+          echo "  RAM            : $(free -g | awk '/^Mem:/{print $2}') GB"
+
+          # Argumen Bazel disuntikkan lewat bazelrc yang di-generate di sini.
+          # Menulis build.sh milik device modules tidak aman: folder itu
+          # di-sync ulang setiap run sehingga edit-an lokal hilang.
+          RC="$RUNNER_TEMP/ci_fast.bazelrc"
+          mkdir -p "$RUNNER_TEMP/bazel_disk_cache" "$RUNNER_TEMP/bazel_repo_cache"
+          cat > "$RC" <<BAZELRC
+          build --jobs=${CPU}
+          build --incompatible_strict_action_env
+          build --disk_cache=$RUNNER_TEMP/bazel_disk_cache
+          build --repository_cache=$RUNNER_TEMP/bazel_repo_cache
+          fetch --disk_cache=$RUNNER_TEMP/bazel_disk_cache
+          fetch --repository_cache=$RUNNER_TEMP/bazel_repo_cache
+          BAZELRC
+
+          # build.sh memanggil tools/bazel. Bazel membaca bazelrc home
+          # (/etc/bazel.bazelrc) dan milik workspace; BAZELRC menambah
+          # milik kita tanpa menimpa yang lain.
+          export BAZELRC="$RC"
+
+          time ./$DMDIR/build.sh
+
+      - name: Ekstrak Image + laporkan versi
+        id: report
+        run: |
+          set -euo pipefail
+
           echo "=== out/ ==="
           ls -la out/ 2>/dev/null || echo "  (tidak ada out/)"
           echo
-          echo "=== kandidat Image / vmlinux di out/dist ==="
-          find out/dist -type f \( -name "Image" -o -name "Image.*" -o -name "Image-*" -o -name "vmlinux" \) \
-            -printf "%10s  %p\n" 2>/dev/null | sort -rn | head -20
-          echo
-          echo "=== struktur out/dist (depth 2) ==="
-          find out/dist -maxdepth 2 2>/dev/null | head -50
 
-      - name: Ekstrak Image + laporkan versi
-        run: |
-          set -euo pipefail
-          mkdir -p "$IMGOUT"
-
+          # out/dist boleh menaruh Image dalam bentuk terkompresi, dan yang
+          # terbesar dipilih apa adanya.
           IMG=$(find out/dist -type f \
-                  \( -name "Image" -o -name "Image.*" -o -name "Image-*" \) \
-                  ! -name "*.dtb" -printf "%s\t%p\n" 2>/dev/null \
+                  \( -name 'Image' -o -name 'Image.*' -o -name 'Image-*' \) \
+                  ! -name '*.dtb' -printf '%s\t%p\n' 2>/dev/null \
                 | sort -rn | head -1 | cut -f2-)
 
           if [ -z "$IMG" ]; then
-            echo "::error:: tidak ada file Image di out/dist"
+            echo "::error::tidak ada file Image di out/dist"
             exit 1
           fi
 
@@ -148,44 +414,41 @@ jobs:
           ls -la "$IMG"
           file "$IMG" || true
           sha256sum "$IMG"
-          cp "$IMG" "$IMGOUT/$(basename "$IMG")"
-          echo
-          echo "=== isi $IMGOUT ==="
-          ls -la "$IMGOUT/"
 
-      - name: Baca version string dari dalam Image
-        run: |
-          set -euo pipefail
-          for f in "$IMGOUT"/*; do
-            [ -f "$f" ] || continue
-            echo "######## $(basename "$f") ########"
-            echo "--- 32 byte pertama ---"
-            xxd -l 32 "$f" || true
-            TMP=$(mktemp)
-            case "$f" in
-              *.gz)  gunzip -c "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
-              *.lz4) lz4 -d -c "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
-              *.xz)  xz -dc  "$f" > "$TMP" 2>/dev/null || cp "$f" "$TMP" ;;
-              *)     cp "$f" "$TMP" ;;
-            esac
-            echo "--- Linux version string ---"
-            VER=$(strings "$TMP" | grep -m1 -E "Linux version [0-9]" || true)
-            if [ -n "$VER" ]; then
-              echo "$VER"
-              echo "VERSION=${VER#Linux version }" >> "$GITHUB_ENV"
-              echo "::notice title=Versi Kernel::$VER"
-            else
-              echo "  (tidak ketemu)"
-            fi
-            echo "--- jejak klee ---"
-            strings "$TMP" | grep -m3 -iE "klee" || echo "  (tidak ada)"
-            echo "--- scan marker ---"
-            for M in raccoon kernelnext susfs patchv; do
-              C=$(strings "$TMP" | grep -ic "$M" || true)
-              printf "  %-12s %s hit\n" "$M" "$C"
-            done
-            rm -f "$TMP"
-            echo
+          mkdir -p "$IMGOUT"
+          cp "$IMG" "$IMGOUT/$(basename "$IMG")"
+
+          # Buka kompresi bila perlu, lalu satu kali pemindaian string dan
+          # semua pemeriksaan memakai hasilnya.
+          TMP=$(mktemp)
+          STR=$(mktemp)
+          trap 'rm -f "$TMP" "$STR"' EXIT
+          case "$IMG" in
+            *.gz)  gunzip -c "$IMG" > "$TMP" 2>/dev/null || cp "$IMG" "$TMP" ;;
+            *.lz4) lz4 -d -c "$IMG" > "$TMP" 2>/dev/null || cp "$IMG" "$TMP" ;;
+            *.xz)  xz -dc  "$IMG" > "$TMP" 2>/dev/null || cp "$IMG" "$TMP" ;;
+            *)     cp "$IMG" "$TMP" ;;
+          esac
+          strings "$TMP" > "$STR"
+
+          echo
+          echo "--- Linux version string ---"
+          VER=$(grep -m1 -E "Linux version [0-9]" "$STR" || true)
+          if [ -n "$VER" ]; then
+            echo "  $VER"
+            echo "version=${VER#Linux version }" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Versi Kernel::$VER"
+          else
+            echo "  (tidak ketemu)"
+            echo "version=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "--- jejak klee ---"
+          grep -m3 -iE "klee" "$STR" || echo "  (tidak ada)"
+
+          echo "--- scan marker ---"
+          for M in raccoon kernelnext susfs patchv; do
+            printf '  %-12s %s hit\n' "$M" "$(grep -ic "$M" "$STR" || true)"
           done
 
       - name: Paket AnyKernel (flashable)
@@ -193,14 +456,14 @@ jobs:
           set -euo pipefail
 
           if [ ! -d anykernel ]; then
-            echo "::error:: folder anykernel/ tidak ada di repo — commit template AnyKernel3 dulu"
+            echo "::error::folder anykernel/ tidak ada di repo — commit template AnyKernel3 dulu"
             exit 1
           fi
 
           IMG=$(find "$IMGOUT" -maxdepth 1 -type f ! -name '*.gz' \
                   -printf '%s\t%p\n' | sort -rn | head -1 | cut -f2-)
           if [ -z "$IMG" ]; then
-            echo "::error:: tidak ada Image di $IMGOUT"; exit 1
+            echo "::error::tidak ada Image di $IMGOUT"; exit 1
           fi
 
           WORK="$RUNNER_TEMP/ak"
@@ -219,16 +482,15 @@ jobs:
           echo "=== isi zip (harus ada Image.gz + anykernel.sh di root) ==="
           unzip -l "$ZIP" | head -25
 
-          # validasi: Image.gz wajib ada, Image polos tidak boleh ada (akan menimpa)
           LIST=$(unzip -Z1 "$ZIP")
           for req in Image.gz anykernel.sh META-INF/com/google/android/update-binary \
                      META-INF/com/google/android/updater-script tools/ak3-core.sh; do
             if ! printf '%s\n' "$LIST" | grep -qx "$req"; then
-              echo "::error:: $req tidak ada di root zip"; exit 1
+              echo "::error::$req tidak ada di root zip"; exit 1
             fi
           done
           if printf '%s\n' "$LIST" | grep -qx 'Image'; then
-            echo "::error:: ada Image polos di zip — akan menimpa Image.gz"; exit 1
+            echo "::error::ada Image polos di zip — akan menimpa Image.gz"; exit 1
           fi
 
           echo "OK: $ZIP"
@@ -237,7 +499,6 @@ jobs:
         if: inputs.package_full
         run: |
           set -euo pipefail
-          mkdir -p "$ARTIFACT"
           cd out/dist
           zip -r9 "$ARTIFACT/K-One-Kernel-dist-${DATE}.zip" .
           ls -la "$ARTIFACT/"
@@ -267,36 +528,76 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # Simpan cache hanya setelah build dan upload selesai, supaya out/
+      # benar-benar berisi hasil build. Versi sebelumnya menaruh langkah
+      # ini sebelum Sync kernel source, sehingga out/ belum ada dan
+      # tidak ada yang tersimpan sama sekali.
+      #
+      # Di mode reuse tidak disimpan: out/ yang dipulangkan milik run asal, dan
+      # menimpanya berarti run berikutnya kehilangan titik awal yang sama.
+      - name: Simpan cache output build
+        if: inputs.use_cache && inputs.reuse_run == '' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            out
+            ${{ runner.temp }}/bazel_disk_cache
+          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ steps.cachekey.outputs.key }}
+
   create_release:
     name: Create Release
-    needs: [prepare, build_kernel]
+    needs: build_kernel
+    # Default-nya `if: success()`, dan itu sudah benar sekarang: build_kernel
+    # tidak pernah di-skip, termasuk mode reuse. Mode reuse hanya memulangkan
+    # out/ sebagai titik awal, build-nya tetap jalan.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     env:
-      TAG: K-One-Kernel-${{ needs.prepare.outputs.date }}
-      DATE: ${{ needs.prepare.outputs.date }}
+      TAG: K-One-Kernel-${{ needs.build_kernel.outputs.date }}
+      DATE: ${{ needs.build_kernel.outputs.date }}
 
     steps:
-      - name: Checkout repository
+      # Tentukan lebih dulu apakah ini build baru atau reuse, lalu isi DATE,
+      # VERSION, TAG sesuai mode. Env TAG dan DATE di level job memakai
+      # needs.build_kernel.outputs yang kosong di mode reuse, jadi harus ditulis
+      # ulang di sini lewat GITHUB_ENV.
+      - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Setup git authentication
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-
-      - name: Create git tag
-        run: |
-          git tag -a "$TAG" -m "K-One-Kernel $TAG"
-          git push origin "$TAG"
-
+      # Build kernel selalu jalan, termasuk mode reuse: yang dipulangkan di
+      # mode reuse cuma out/ sebagai titik awal, lalu bazel membangun ulang
+      # hanya bagian yang berubah. Tidak ada langkah yang menyalin Image dari
+      # run lain, karena itu bukan build yang valid.
       - name: Download zip flashable saja
         uses: actions/download-artifact@v4
         with:
           name: K-One-Kernel-${{ env.DATE }}
           path: release-asset
+
+
+      - name: Verifikasi artifact
+        run: |
+          set -euo pipefail
+          ZIP="release-asset/K-One-Kernel-${DATE}.zip"
+          [ -s "$ZIP" ] || { echo "::error::$ZIP kosong atau hilang"; exit 1; }
+          unzip -tq "$ZIP" || { echo "::error::zip flashable korup"; exit 1; }
+          echo "sha256=$(sha256sum "$ZIP" | cut -d' ' -f1)"
+
+      - name: Create git tag
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::tag $TAG sudah ada di origin, tunggu menit berikutnya agar tidak bentrok"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "K-One-Kernel $TAG"
+          git push origin "$TAG"
 
       - name: Pasang zip flashable ke release
         uses: softprops/action-gh-release@v1
@@ -304,15 +605,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.TAG }}
-          name: K-One-Kernel ${{ env.DATE }}
+          name: K-One-Kernel ${{ env.DATE }}${{ inputs.reuse_dirty && ' [UNVERIFIED]' || '' }}
           fail_on_unmatched_files: true
           files: release-asset/K-One-Kernel-${{ env.DATE }}.zip
+          # Ditulis sebagai blok teks YAML, bukan string \n. Di dalam body:
+          # blok YAML, \n di dalam ${{ }} tidak di-escape sehingga akan muncul
+          # sebagai karakter "\" dan "n" yang nyata.
           body: |
             ## K-One-Kernel
 
+            ${{ inputs.reuse_run != '' && '> [!NOTE]' || '' }}
+            ${{ inputs.reuse_run != '' && format('> Build ini memakai `out/` dari run `{0}` sebagai titik awal, lalu dikompilasi ulang.', inputs.reuse_run) || '' }}
+            ${{ inputs.reuse_run != '' && '> Hanya bagian yang berubah yang dibangun ulang, tapi ini tetap build sungguhan, bukan hasil salin.' || '' }}
+            ${{ inputs.reuse_dirty && '> [!CAUTION]' || '' }}
+            ${{ inputs.reuse_dirty && '> Ditandai `reuse_dirty`: kernel ini belum terverifikasi boot di perangkat.' || '' }}
+
             Device Target: POCO X8 Pro / Redmi Turbo 5 (`klee`)
             SoC: MediaTek MT6899
-            Kernel: `6.6.89-android15-8-maybe-dirty-K-One-Kernel`
+            Kernel: `${{ needs.build_kernel.outputs.version }}`
             Base: GKI `android15-6.6-2025-09`
             Toolchain: Bazel/Kleaf, Clang r510928
             Root: none (KernelSU removed)
