@@ -35,9 +35,9 @@ no_magisk_check=1
 # boot install
 split_boot
 
-## K-One-Kernel: NO_HZ_FULL hanya aktif bila CPU big diisolasi lewat nohz_full=
-## tanpa argumen ini CONFIG_NO_HZ_FULL tidak memberi efek apa pun.
-patch_cmdline nohz_full "nohz_full=4-7 nohz_full_rcu=4-7"
+## K-One-Kernel: argumen nohz_full sengaja dihapus.
+## CONFIG_NO_HZ_FULL sudah tidak diaktifkan (patch 0008 di-revert), dan
+## kernel akan menolak boot bila diberi nohz_full= tanpa dukungan itu.
 
 if [ -f "split_img/ramdisk.cpio" ]; then
     unpack_ramdisk
