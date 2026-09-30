@@ -134,11 +134,20 @@ jobs:
           set -euo pipefail
           repo init -u "$KERNEL_MANIFEST_URL" -b "$KERNEL_MANIFEST_BRANCH" --depth=1
           git clone --depth=1 "$LOCAL_MANIFEST_REPO" .repo/local_manifests
+          # Clone saja tidak cukup: repo sync hanya membaca manifest yang ada di
+          # .repo/manifests, jadi local_manifest.xml harus disalin ke sana.
+          # Tanpa langkah ini revisi di local_manifest.xml (mis. tag kernel yang
+          # lebih baru) diam-diam diabaikan dan build memakai branch default.
+          install -m0644 .repo/local_manifests/local_manifest.xml \
+            .repo/manifests/local_manifest.xml
           # --optimized-fetch memakai objek yang sudah ada di cache dan hanya
           # menarik yang kurang. --force-sync sengaja dihapus: workspace selalu
           # kosong, jadi checkout ulang tidak memberi manfaat dan hanya lambat.
           repo sync -j"$(nproc --all)" --no-clone-bundle --no-tags \
             --optimized-fetch --fail-fast
+          echo "== revision kernel efektif setelah sync =="
+          grep -E 'android_kernel-6.6|revision' .repo/manifests/local_manifest.xml \
+            || true
           for d in "$KDIR" "$DMDIR"; do
             [ -d "$d" ] || { echo "::error::$d tidak ada setelah sync"; exit 1; }
           done
