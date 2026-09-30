@@ -1,20 +1,27 @@
 Subject: [PATCH] config: matikan overhead debug dan sanitizer di gki_defconfig
 
-gki_defconfig klee mengaktifkan KASAN (termasuk KASAN_HW_TAGS),
-UBSAN_SANITIZE_ALL, SCHED_DEBUG, DEBUG_INFO, KFENCE, dan SLUB_DEBUG.
-Semuanya untuk debug, bukan untuk produksi.
+gki_defconfig klee menyalakan SCHED_DEBUG, DEBUG_INFO, KASAN,
+UBSAN_SANITIZE_ALL, KFENCE, dan SLUB_DEBUG. Semuanya untuk debug,
+bukan untuk produksi.
 
-Dampak yang nyata:
+Yang perlu jujur dicatat: KASAN dan UBSAN tidak diaktifkan oleh
+build.config.mtk.aarch64. File .kasan dan .ubsan ada sebagai build
+config terpisah, tapi build.sh tidak memilihnya, sehingga yang
+menggantung di defconfig kemungkinan besar sudah dinormalkan oleh
+syncconfig. Jadi baris KASAN/UBSAN di sini bukan penyebab build
+lambat, dan patch ini tidak mengklaim sebaliknya.
 
-- KASAN_HW_TAGS menambahkan tag hardware ke setiap alokasi memory, sehingga
-  alokasi menjadi lebih mahal di compile maupun di runtime.
-- UBSAN_SANITIZE_ALL mem-instrument seluruh kode, termasuk driver.
-- SCHED_DEBUG menyisipkan sched_debug() ke jalur panas scheduler seperti
-  enqueue_dequeue() dan dequeue_task(), yaitu jalur yang dipanggil ribuan
-  kali per detik.
-- DEBUG_INFO membuat vmlinux jauh lebih besar dan build jauh lebih lama
-  tanpa mengubah perilaku runtime sama sekali.
-- KFENCE menjalankan periodic sampling yang membebani allocator.
+Yang benar-benar dibaca Kbuild apa adanya, dan itu yang dimekan:
+
+- SCHED_DEBUG menyisipkan sched_debug() ke jalur panas scheduler,
+  termasuk enqueue_dequeue() dan dequeue_task(). CONFIG_SCHED_INFO
+  yang bergantung padanya dibiarkan tetap aktif, jadi
+  /sys/kernel/debug/sched masih berfungsi.
+- DEBUG_INFO, DEBUG_INFO_DWARF5, dan DEBUG_INFO_REDUCED menambah
+  pekerjaan emit DWARF dan memperbesar vmlinux tanpa mengubah
+  perilaku runtime.
+- SLUB_DEBUG=on menambah branch di jalur alokasi memory yang
+  dieksekusi sangat sering.
 
 Semua perubahan ini murni di gki_defconfig, bukan di langkah
 modules_install. Dulu ada langkah config hardening di build.yml yang
