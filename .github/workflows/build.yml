@@ -30,7 +30,10 @@ on:
 # sedang jalan. Naikkan ke true bila kamu memang ingin run terbaru mengalahkan
 # run lama.
 concurrency:
-  group: kok-${{ github.workflow }}-${{ github.ref }}
+  # Mode reuse dipisah supaya tidak ikut antre di belakang build 40 menit
+  # yang sedang jalan. Release dari artifact lama tidak berebut dengan build
+  # baru anyway, dan tagnya juga sudah dibedakan timestamp.
+  group: kok-${{ github.workflow }}-${{ github.ref }}-${{ inputs.reuse_run == '' && 'build' || 'reuse' }}
   cancel-in-progress: false
 
 permissions:
