@@ -111,17 +111,6 @@ jobs:
           restore-keys: |
             kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-
 
-      # Simpan cache baru SETELAH build sukses, supaya cache yang terisi
-      # tidak berasal dari run yang gagal di tengah jalan.
-      - name: Simpan cache output build
-        if: inputs.use_cache && success()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            out
-            ${{ runner.temp }}/bazel_disk_cache
-          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ hashFiles('local_manifest.xml', 'patches/**', 'patches-modules/**') }}
-
       - name: Sync kernel source
         run: |
           set -euo pipefail
@@ -383,6 +372,19 @@ jobs:
           path: ${{ env.ARTIFACT }}/K-One-Kernel-dist-${{ env.DATE }}.zip
           if-no-files-found: error
           retention-days: 14
+
+      # Simpan cache hanya setelah build dan upload selesai, supaya out/
+      # benar-benar berisi hasil build. Versi sebelumnya menaruh langkah
+      # ini sebelum Sync kernel source, sehingga out/ belum ada dan
+      # tidak ada yang tersimpan sama sekali.
+      - name: Simpan cache output build
+        if: inputs.use_cache && success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            out
+            ${{ runner.temp }}/bazel_disk_cache
+          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ hashFiles('local_manifest.xml', 'patches/**', 'patches-modules/**') }}
 
   create_release:
     name: Create Release
