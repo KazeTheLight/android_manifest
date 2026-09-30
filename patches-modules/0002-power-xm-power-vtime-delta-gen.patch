@@ -1,0 +1,63 @@
+K-One-Kernel: perbaiki build xm_power pada CONFIG_VIRT_CPU_ACCOUNTING_GEN
+
+CONFIG_NO_HZ_FULL (patch 0008) secara otomatis memilih
+CONFIG_VIRT_CPU_ACCOUNTING_GEN melalui baris "select" di kernel/time/Kconfig.
+Sebelum itu simbol tersebut tidak aktif, sehingga seluruh blok
+CONFIG_VIRT_CPU_ACCOUNTING_GEN di driver vendor xm_power.c dibuang oleh
+preprocessor dan tidak pernah dikompilasi.
+
+Ketika simbol aktif, task_cputime() versi GEN ikut aktif dan memanggil
+vtime_delta(). Fungsi tersebut hanya ada sebagai helper "static" di
+kernel/sched/cputime.c, tidak di-EXPORT, dan tidak dideklarasikan pada
+header publik mana pun. Akibatnya build modul gagal dengan:
+
+  xm_power.c:206:11: error: call to undeclared function 'vtime_delta';
+  ISO C99 and later do not support implicit function declarations
+
+Tambahkan salinan lokal helper tersebut, ditambah include yang dibutuhkan
+(linux/vtime.h, linux/sched/clock.h, linux/seqlock.h), lalu arahkan call
+site ke helper lokal. sched_clock() memang EXPORT_SYMBOL_GPL sehingga
+boleh dipanggil dari modul. Perilaku dan hasil perhitungan tetap sama
+dengan implementasi di kernel/sched/cputime.c.
+--- a/drivers/power/xm_power/xm_power.c
++++ b/drivers/power/xm_power/xm_power.c
+@@ -1,5 +1,30 @@
+ #include "xm_power.h"
+ 
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
++#include <linux/seqlock.h>
++#include <linux/sched/clock.h>
++#include <linux/vtime.h>
++
++/*
++ * vtime_delta() is a private helper of kernel/sched/cputime.c: it is static
++ * and never exported, so a module cannot reference it. Enabling
++ * CONFIG_NO_HZ_FULL selects CONFIG_VIRT_CPU_ACCOUNTING_GEN, which makes the
++ * task_cputime() branch below reachable and broke the build with
++ * "call to undeclared function 'vtime_delta'". Replicate the helper here.
++ */
++static u64 xm_vtime_delta(const struct vtime *vtime)
++{
++	unsigned long long clock;
++
++	clock = sched_clock();
++	if (clock < vtime->starttime)
++		return 0;
++
++	return clock - vtime->starttime;
++}
++#endif
++
++
+ #ifdef pr_fmt
+ #undef pr_fmt
+ #endif
+@@ -203,7 +228,7 @@
+ 		if (vtime->state < VTIME_SYS)
+ 			continue;
+ 
+-		delta = vtime_delta(vtime);
++		delta = xm_vtime_delta(vtime);
+ 
+ 		/*
+ 		 * Task runs either in user (including guest) or kernel space,
