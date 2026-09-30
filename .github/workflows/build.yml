@@ -133,11 +133,10 @@ jobs:
         run: |
           set -euo pipefail
           repo init -u "$KERNEL_MANIFEST_URL" -b "$KERNEL_MANIFEST_BRANCH" --depth=1
-          git clone --depth=1 "$LOCAL_MANIFEST_REPO" .repo/local_manifests
-          # Clone saja tidak cukup: repo sync hanya membaca manifest yang ada di
-          # .repo/manifests, jadi local_manifest.xml harus disalin ke sana.
-          # Tanpa langkah ini revisi di local_manifest.xml (mis. tag kernel yang
-          # lebih baru) diam-diam diabaikan dan build memakai branch default.
+          git clone --depth=1 --branch "$GITHUB_REF_NAME" "$LOCAL_MANIFEST_REPO" .repo/local_manifests
+          # --branch itu wajib: tanpa itu clone mengambil default branch repo,
+          # sehingga local_manifest.xml dari branch yang sedang dibangun tidak
+          # pernah terbawa dan revisi kernel yang ada di dalamnya diabaikan.
           install -m0644 .repo/local_manifests/local_manifest.xml \
             .repo/manifests/local_manifest.xml
           # --optimized-fetch memakai objek yang sudah ada di cache dan hanya
@@ -146,8 +145,24 @@ jobs:
           repo sync -j"$(nproc --all)" --no-clone-bundle --no-tags \
             --optimized-fetch --fail-fast
           echo "== revision kernel efektif setelah sync =="
-          grep -E 'android_kernel-6.6|revision' .repo/manifests/local_manifest.xml \
-            || true
+          grep -E 'android_kernel-6\.6' .repo/manifests/local_manifest.xml || true
+          # Guard: manifest yang disalin harus benar-benar yang dipakai repo sync.
+          # Tanpa ini revisi yang salah hanya terdeteksi setelah build 60+ menit.
+          WANT_REV=$(sed -n 's/.*name="android_kernel-6\.6".*revision="\([^"]*\)".*/\1/p' \
+            .repo/manifests/local_manifest.xml | head -1)
+          GOT_REV=$(sed -n 's/.*name="android_kernel-6\.6".*revision="\([^"]*\)".*/\1/p' \
+            .repo/manifests.xml 2>/dev/null | head -1)
+          GOT_REV=${GOT_REV:-$(sed -n 's/.*name="android_kernel-6\.6".*revision="\([^"]*\)".*/\1/p' \
+            .repo/manifest.xml 2>/dev/null | head -1)}
+          echo "   manifest ingin : ${WANT_REV:-<tidak ada>}"
+          echo "   repo sync pakai : ${GOT_REV:-<tidak terbaca>}"
+          # Hanya gagal kalau revisi yang terbaca jelas berbeda. Kalau file
+          # manifest tidak ada format yang diharapkan, tetap lanjut agar tidak
+          # memblokir build yang sebenarnya benar.
+          if [ -n "${WANT_REV:-}" ] && [ -n "${GOT_REV:-}" ] && [ "$WANT_REV" != "$GOT_REV" ]; then
+            echo "::error::revisi kernel tidak terpakai (manifest=$WANT_REV sync=$GOT_REV)"
+            exit 1
+          fi
           for d in "$KDIR" "$DMDIR"; do
             [ -d "$d" ] || { echo "::error::$d tidak ada setelah sync"; exit 1; }
           done
