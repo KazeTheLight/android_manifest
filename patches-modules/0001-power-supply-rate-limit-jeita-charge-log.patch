@@ -1,0 +1,67 @@
+K-One-Kernel: rate-limit spam [CHARGE_LOOP] pada driver charger MTK
+
+check_charge_data() dipanggil dari loop charger setiap sekitar 500 ms.
+Tiga mca_log_err di akhir fungsi tersebut (fcc/icl votable, [CHARGE_LOOP]
+TYPE/BMS/FULL, dan input_suspend) tercetak pada setiap iterasi sehingga
+dmesg terisi ribuan baris per menit. Setiap printk dapat membangkitkan
+CPU dan memicu penjadwalan, sehingga frekuensi core besar ikut naik.
+
+Batasi emission menjadi satu blok laporan penuh per 30 detik. Log tetap
+terbaca untuk keperluan diagnosa, namun volumenya turun sekitar 60x.
+
+Log untuk kondisi typec_burn dan input_suspend ikut dibatasi pada blok
+yang sama. Proteksi perangkat keras tetap bekerja seketika; yang dibatasi
+hanya pencetakan log-nya.
+--- a/drivers/power/supply/step_jeita_charge.c
++++ b/drivers/power/supply/step_jeita_charge.c
+@@ -24,6 +24,7 @@
+ #include <linux/power_supply.h>
+ #include <linux/iio/consumer.h>
+ #include <linux/time.h>
++#include <linux/jiffies.h>
+ #include <linux/mca/common/mca_log.h>
+ #include <linux/mca/common/mca_event.h>
+ #include <linux/mca/common/mca_charge_mievent.h>
+@@ -1910,6 +1911,13 @@
+ 	chr_err("soc=%d, vbat=%d, vbat2=%d, ibat=%d, tbat=%d, cycle=%d, auth=%d, cp_vbat=%d\n", info->soc, info->vbat_now, info->vbat_now_slave, info->current_now, info->temp_now, info->cycle_count, info->gauge_authentic, info->cp_vbat);
+ }
+ 
++/* K-One-Kernel: check_charge_data() dipanggil dari loop charger setiap ~500 ms.
++ * Tanpa rate limit, tiga mca_log_err di bawah membanjiri dmesg (ribuan baris
++ * per menit) dan setiap printk dapat membangkitkan CPU. Jaga agar laporan tetap
++ * terbaca tanpa membanjiri log. */
++#define CHARGE_LOG_INTERVAL_MS	30000
++static unsigned long charge_log_ts;
++
+ static void check_charge_data(struct mtk_charger *info)
+ {
+ 	union power_supply_propval pval = {0,};
+@@ -2214,15 +2222,20 @@
+ 	}
+ 
+ 	info->diff_fv_val = max(info->diff_fv_val,  max(info->set_smart_batt_diff_fv, info->set_smart_fv_diff_fv));
+-	mca_log_err("fcc_votable = [%s %d], icl_votable = [%s %d]\n",
+-		get_effective_client(info->fcc_votable), get_effective_result(info->fcc_votable), get_effective_client(info->icl_votable), get_effective_result(info->icl_votable));
++	if (time_after(jiffies, charge_log_ts + msecs_to_jiffies(CHARGE_LOG_INTERVAL_MS))) {
++		charge_log_ts = jiffies;
++
++		mca_log_err("fcc_votable = [%s %d], icl_votable = [%s %d]\n",
++			get_effective_client(info->fcc_votable), get_effective_result(info->fcc_votable), get_effective_client(info->icl_votable), get_effective_result(info->icl_votable));
+ 
+-	mca_log_err("[CHARGE_LOOP] TYPE = [%d %d %d %d], BMS = [%d %d %d %d], FULL = [%d %d %d %d %d], thermal_level=%d, FFC = %d, sw_cv=%d, gauge_authentic=%d, warm_term=%d, cell=%d, smart_batt:%d, smart_fv:%d\n",
+-		info->pd_type, info->pd_adapter->verifed, info->real_type, info->qc3_type, info->soc, info->vbat_now, info->current_now, info->temp_now,
+-		info->bbc_charge_enable, info->charge_full, info->fg_full, info->bbc_charge_done, info->recharge, info->thermal_level, info->ffc_enable,
+-		info->sw_cv, info->gauge_authentic, info->warm_term, info->batt_cell_supplier, info->set_smart_batt_diff_fv, info->set_smart_fv_diff_fv);
+-	if (info->input_suspend || info->typec_burn || info->short_typec_burn)
+-		mca_log_err("[CHARGE_LOOP] input_suspend = %d, typec_burn = %d, short_typec_burn = %d\n", info->input_suspend, info->typec_burn, info->short_typec_burn);
++		mca_log_err("[CHARGE_LOOP] TYPE = [%d %d %d %d], BMS = [%d %d %d %d], FULL = [%d %d %d %d %d], thermal_level=%d, FFC = %d, sw_cv=%d, gauge_authentic=%d, warm_term=%d, cell=%d, smart_batt:%d, smart_fv:%d\n",
++			info->pd_type, info->pd_adapter->verifed, info->real_type, info->qc3_type, info->soc, info->vbat_now, info->current_now, info->temp_now,
++			info->bbc_charge_enable, info->charge_full, info->fg_full, info->bbc_charge_done, info->recharge, info->thermal_level, info->ffc_enable,
++			info->sw_cv, info->gauge_authentic, info->warm_term, info->batt_cell_supplier, info->set_smart_batt_diff_fv, info->set_smart_fv_diff_fv);
++		if (info->input_suspend || info->typec_burn || info->short_typec_burn)
++			mca_log_err("[CHARGE_LOOP] input_suspend = %d, typec_burn = %d, short_typec_burn = %d\n", info->input_suspend, info->typec_burn, info->short_typec_burn);
++
++	}
+ }
+ 
+ 

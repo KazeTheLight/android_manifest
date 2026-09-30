@@ -77,6 +77,23 @@ jobs:
           echo
           echo "::notice title=Localversion::diharapkan uname -r = 6.6.89-android15-8-maybe-dirty-K-One-Kernel"
 
+      - name: Terapkan patch K-One-Kernel (device modules)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(patches-modules/*.patch)
+          if [ ${#PATCHES[@]} -eq 0 ]; then
+            echo "::notice:: tidak ada patch di patches-modules/*.patch, langkah dilewati"
+            exit 0
+          fi
+          if [ ! -d kernel_device_modules-6.6 ]; then
+            echo "::error:: kernel_device_modules-6.6 tidak ada di workspace"; exit 1
+          fi
+          for p in "${PATCHES[@]}"; do
+            echo "=== applying $p (kernel_device_modules-6.6) ==="
+            patch -p1 -d kernel_device_modules-6.6 --forward --no-backup-if-mismatch < "$p"
+          done
+
       - name: Hapus KernelSU
         run: |
           set -euo pipefail
