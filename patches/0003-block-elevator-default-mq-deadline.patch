@@ -1,0 +1,45 @@
+K-One-Kernel: jadikan mq-deadline sebagai default I/O scheduler
+
+Pada kernel 6.6 elevator_get_default() mengembalikan NULL begitu sebuah
+device punya lebih dari satu hardware queue, sehingga elevator yang
+terpilih adalah "none". Device UFS termasuk kasus itu, sehingga storage
+utama berjalan tanpa elevator sama sekali: tanpa read-ahead, tanpa
+bounded latency, dan tanpa penggabungan request yang bersebelahan.
+
+mq-deadline tetap valid untuk device multi-queue, jadi jadikan ia
+default juga di sana. Device yang benar-benar tidak boleh memakai
+elevator tetap dihormati lewat flag BLK_MQ_F_NO_SCHED_BY_DEFAULT,
+dan bila mq-deadline tidak tersedia elevator_find_get() mengembalikan
+NULL yang tetap berarti "none".
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -564,18 +564,23 @@
+ }
+ 
+ /*
+- * For single queue devices, default to using mq-deadline. If we have multiple
+- * queues or mq-deadline is not available, default to "none".
++ * K-One-Kernel: default to mq-deadline for every schedulable queue.
++ *
++ * Upstream 6.6 falls back to "none" as soon as a device exposes more than
++ * one hardware queue, which is exactly the case for UFS storage. That leaves
++ * the primary storage with a no-op elevator: no read-ahead, no bounded
++ * request latency, and no merge of adjacent requests.
++ *
++ * mq-deadline is a valid elevator for multi-queue devices, so use it as the
++ * default there too. Devices that genuinely need no elevator are still
++ * honoured through BLK_MQ_F_NO_SCHED_BY_DEFAULT, and if mq-deadline is
++ * unavailable elevator_find_get() returns NULL which still means "none".
+  */
+ static struct elevator_type *elevator_get_default(struct request_queue *q)
+ {
+ 	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
+ 		return NULL;
+ 
+-	if (q->nr_hw_queues != 1 &&
+-	    !blk_mq_is_shared_tags(q->tag_set->flags))
+-		return NULL;
+-
+ 	return elevator_find_get(q, "mq-deadline");
+ }
+ 
