@@ -13,16 +13,16 @@ on:
         default: true
       reuse_run:
         description: >-
-          Mode reuse: isi run-id build yang mau dipakai ulang (contoh: 36681942603).
-          Workflow TIDAK compile, langsung ambil artifact zip dari run itu dan buat
-          release baru. Kosongkan untuk build normal.
+          Pakai out/ dari run ini sebagai titik awal (contoh: 36686083392), lalu
+          build ulang. Hanya bagian yang berubah yang dikompilasi. Harus branch
+          yang sama, karena cache out/ tidak bisa dibaca lintas branch. Kosongkan
+          untuk build biasa.
         type: string
         default: ''
       reuse_dirty:
         description: >-
-          Tandai release ini sebagai hasil reuse / belum teruji di perangkat.
-          Ditulis di judul dan notes supaya tidak tertukar dengan build yang sudah
-          pernah di-flash.
+          Tandai release ini belum terverifikasi boot di perangkat. Ditulis di
+          judul dan notes supaya tidak tertukar dengan build yang sudah di-flash.
         type: boolean
         default: false
 
@@ -30,10 +30,7 @@ on:
 # sedang jalan. Naikkan ke true bila kamu memang ingin run terbaru mengalahkan
 # run lama.
 concurrency:
-  # Mode reuse dipisah supaya tidak ikut antre di belakang build 40 menit
-  # yang sedang jalan. Release dari artifact lama tidak berebut dengan build
-  # baru anyway, dan tagnya juga sudah dibedakan timestamp.
-  group: kok-${{ github.workflow }}-${{ github.ref }}-${{ inputs.reuse_run == '' && 'build' || 'reuse' }}
+  group: kok-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -69,9 +66,6 @@ defaults:
 
 jobs:
   build_kernel:
-    # Mode reuse: tidak ada yang dikompilasi. Job create_release tetap jalan dan
-    # mengambil artifact dari run yang disebut di input reuse_run.
-    if: ${{ inputs.reuse_run == '' }}
     name: Build Kernel
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -270,8 +264,12 @@ jobs:
 
       # Cache output build. Ini penghematan terbesar: saat repo dan isi file
       # hasil patch tidak berubah, Bazel bisa melewati sebagian besar compile.
+      #
+      # Inputs reuse_run mengubah asal cache: bukan lagi "cocokkan dengan isi
+      # patch saat ini", melainkan pakai out/ dari run yang disebut. Itu yang
+      # membuat bisa iterasi di atas build lama tanpa compile dari nol.
       - name: Restore cache output build
-        if: inputs.use_cache
+        if: inputs.use_cache && inputs.reuse_run == ''
         uses: actions/cache@v4
         with:
           path: |
@@ -280,6 +278,78 @@ jobs:
           key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ steps.cachekey.outputs.key }}
           restore-keys: |
             kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-
+
+      # Cache out/ milik run lain. Dipisah dari langkah di atas karena kunci
+      # cache harus dibaca dari log run asal, sedangkan kunci di atas dihitung
+      # ulang di run ini.
+      #
+      # Langkah "Restore cache output build" sengaja dimatikan saat reuse_run
+      # diisi: keduanya menulis ke out/, dan yangrestore belakangan menimpa yang
+      # pertama. restore-keys di bawah juga sengaja dibiarkan kosong; memakai
+      # prefix kok-out- yang longgar bisa menarik out/ dari run yang tidak
+      # diminta, dan hasil restore yang diam-diam berbeda lebih buruk daripada
+      # build dari nol.
+      - name: Restore out dari run sebelumnya
+        if: inputs.use_cache && inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUNNER_OS: ${{ runner.os }}
+          OUT_VER: ${{ env.OUT_CACHE_VERSION }}
+        run: |
+          set -euo pipefail
+
+          # actions/cache tidak bisa restore berdasarkan run-id secara langsung,
+          # jadi kunci cache yang disimpan run asal dibaca dari log-nya, lalu
+          # dipakai sebagai kunci restore.
+          #
+          # runner.os adalah placeholder milik GitHub Actions, tidak tersedia
+          # sebagai variabel shell, jadi dikirim lewat env RUNNER_OS.
+          # Panjang hash tidak diasumsikan: kunci cache bisa berubah bentuk saat
+          # algoritma kuncinya diubah, jadi yang dicocokkan hanya prefix
+          # kok-out-<os>-<versi>- diikuti hex.
+          KEY=$(gh run view "$REUSE_RUN" --repo "$REPO" --log 2>/dev/null \
+            | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -oE "kok-out-${RUNNER_OS}-${OUT_VER}-[0-9a-f]{8,}" \
+            | grep -vE '[.,;]$' \
+            | sort -u | head -1 || true)
+          if [ -z "$KEY" ]; then
+            echo "::warning::run ${REUSE_RUN} tidak menyimpan cache out/, build dari nol"
+            exit 0
+          fi
+          echo "  kunci cache asal: ${KEY}"
+
+          # Cache hanya bisa dibaca pada branch yang sama dengan tempat ia
+          # disimpan. Melewati branch di sini akan diam-diam menghasilkan
+          # build dari nol, jadi lebih baik gagal dengan pesan yang jelas.
+          CACHE_REF=$(gh api "repos/${REPO}/actions/caches?key=${KEY}" \
+            -q '.actions_caches[0].ref // empty')
+          if [ -z "$CACHE_REF" ]; then
+            echo "::error::cache ${KEY} tidak ada di repo ini (mungkin sudah kedaluwarsa)"
+            exit 1
+          fi
+          CURRENT_REF="refs/heads/${GITHUB_REF_NAME}"
+          if [ "$CACHE_REF" != "$CURRENT_REF" ]; then
+            echo "::error::cache ${KEY} ada di ${CACHE_REF}, sekarang di ${CURRENT_REF}"
+            echo "::error::cache tidak bisa lintas branch, jalankan dari branch yang sama"
+            exit 1
+          fi
+          echo "  ${KEY}" >> "$GITHUB_OUTPUT"
+        id: reusekey
+
+      # Memakai actions/cache/restore, bukan actions/cache, supaya tidak ada
+      # langkah simpan yang menimpa cache asli milik run asal. Run ini hanya
+      # membaca turunan yang sudah ada.
+      - name: Pakai out dari run sebelumnya
+        if: inputs.use_cache && inputs.reuse_run != '' && steps.reusekey.outputs.cache_key != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            out
+            ${{ runner.temp }}/bazel_disk_cache
+          key: ${{ steps.reusekey.outputs.cache_key }}
+          restore-keys: |
+            ${{ steps.reusekey.outputs.cache_key }}
 
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -455,8 +525,11 @@ jobs:
       # benar-benar berisi hasil build. Versi sebelumnya menaruh langkah
       # ini sebelum Sync kernel source, sehingga out/ belum ada dan
       # tidak ada yang tersimpan sama sekali.
+      #
+      # Di mode reuse tidak disimpan: out/ yang dipulangkan milik run asal, dan
+      # menimpanya berarti run berikutnya kehilangan titik awal yang sama.
       - name: Simpan cache output build
-        if: inputs.use_cache && success()
+        if: inputs.use_cache && inputs.reuse_run == '' && success()
         uses: actions/cache/save@v4
         with:
           path: |
@@ -467,168 +540,37 @@ jobs:
   create_release:
     name: Create Release
     needs: build_kernel
-    # Default-nya `if: success()`, yang membuat job ini ikut ke-skip begitu
-    # build_kernel di-skip di mode reuse. always() dipakai supaya tetap jalan;
-    # syarat kedua mencegah job ini jalan bila build_kernel benar-benar gagal.
-    if: ${{ always() && (needs.build_kernel.result == 'success' || inputs.reuse_run != '') }}
+    # Default-nya `if: success()`, dan itu sudah benar sekarang: build_kernel
+    # tidak pernah di-skip, termasuk mode reuse. Mode reuse hanya memulangkan
+    # out/ sebagai titik awal, build-nya tetap jalan.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
-      # Diperlukan untuk actions/download-artifact membaca artifact dari run lain.
-      actions: read
     env:
-      REUSE_RUN: ${{ inputs.reuse_run }}
-      REUSE_DIRTY: ${{ inputs.reuse_dirty }}
-      # Kosong di mode reuse karena build_kernel tidak jalan. Diisi ulang oleh
-      # langkah "Tentukan sumber release" di bawah.
-      BUILD_DATE: ${{ needs.build_kernel.outputs.date }}
-      BUILD_VERSION: ${{ needs.build_kernel.outputs.version }}
       TAG: K-One-Kernel-${{ needs.build_kernel.outputs.date }}
       DATE: ${{ needs.build_kernel.outputs.date }}
-      VERSION: ${{ needs.build_kernel.outputs.version }}
 
     steps:
       # Tentukan lebih dulu apakah ini build baru atau reuse, lalu isi DATE,
       # VERSION, TAG sesuai mode. Env TAG dan DATE di level job memakai
       # needs.build_kernel.outputs yang kosong di mode reuse, jadi harus ditulis
       # ulang di sini lewat GITHUB_ENV.
-      - name: Tentukan sumber release
-        id: src
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$REUSE_RUN" ]; then
-            echo "mode=build" >> "$GITHUB_OUTPUT"
-            echo "artifact_name=K-One-Kernel-${BUILD_DATE}" >> "$GITHUB_OUTPUT"
-            echo "DATE=${BUILD_DATE}" >> "$GITHUB_ENV"
-            echo "VERSION=${BUILD_VERSION}" >> "$GITHUB_ENV"
-            echo "TAG=K-One-Kernel-${BUILD_DATE}" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          echo "=== mode reuse: run ${REUSE_RUN} ==="
-          case "$REUSE_RUN" in
-            ''|*[!0-9]*)
-              echo "::error::reuse_run harus berupa angka run-id, dapat: '$REUSE_RUN'"
-              exit 1
-              ;;
-          esac
-
-          # Cari artifact zip flashable, bukan yang Image kecil. Pola nama zip
-          # adalah K-One-Kernel-<12 digit timestamp>.
-          if ! ARTIFACTS=$(gh api "repos/${REPO}/actions/runs/${REUSE_RUN}/artifacts" 2>/dev/null); then
-            echo "::error::run ${REUSE_RUN} tidak ditemukan di ${REPO}"
-            echo "::error::periksa run-id, dan pastikan workflow itu milik repo ini"
-            exit 1
-          fi
-          ARTIFACT_NAME=$(printf '%s' "$ARTIFACTS" \
-            | jq -r '.artifacts[] | select(.name | test("^K-One-Kernel-[0-9]{12}$")) | .name' \
-            | head -1)
-          if [ -z "$ARTIFACT_NAME" ]; then
-            echo "::error::run ${REUSE_RUN} tidak punya artifact zip flashable"
-            printf '%s' "$ARTIFACTS" \
-              | jq -r '.artifacts[].name' | sed 's/^/  ada: /'
-            exit 1
-          fi
-          SRC_DATE="${ARTIFACT_NAME#K-One-Kernel-}"
-          SRC_TAG="K-One-Kernel-${SRC_DATE}"
-          echo "  artifact : ${ARTIFACT_NAME}"
-          echo "  tag asal : ${SRC_TAG}"
-
-          # VERSION tidak tersedia di mode reuse karena build_kernel tidak jalan.
-          # String uname -r itu wajib ada di release notes dan tidak boleh
-          # dikarang, karena pemakainya butuh mencocokkannya dengan uname -r di
-          # perangkat sebelum flash.
-          #
-          # Sumber 1: notes release asal.
-          # Sumber 2: bila release asal belum ada, ambil langsung dari log run
-          # asal lewat step "Ekstrak Image + laporkan versi" yang mencetak
-          # "ekspektasi uname -r = ...".
-          VERSION=""
-          if gh release view "$SRC_TAG" --repo "$REPO" >/dev/null 2>&1; then
-            VERSION=$(gh release view "$SRC_TAG" --repo "$REPO" --json body --jq .body 2>/dev/null \
-              | sed -n 's/^Kernel: `\(.*\)`$/\1/p' | head -1 || true)
-            [ -n "$VERSION" ] && echo "  version  : dari release ${SRC_TAG}"
-          fi
-
-          if [ -z "$VERSION" ]; then
-            echo "  release ${SRC_TAG} belum ada, ambil dari log run asal"
-            # Log GitHub menyisipkan kode warna ANSI, jadi kodenya dibersihkan
-            # dulu. Pola sengaja tidak menyebut kata kunci台词 sebelum "uname -r"
-            # karena baris aslinya-varying (ada yang "diharapkan", ada yang
-            # "ekspektasi"). Hanya kutip penutup yang dibuang.
-            VERSION=$(gh run view "$REUSE_RUN" --repo "$REPO" --log 2>/dev/null \
-              | sed 's/\x1b\[[0-9;]*m//g' \
-              | grep -oE 'uname -r = [0-9][^ ]*( [-+._A-Za-z0-9]+)*' \
-              | sed 's/^uname -r = //; s/"$//' | sort -u | head -1 || true)
-            [ -n "$VERSION" ] && echo "  version  : dari log run ${REUSE_RUN}"
-          fi
-
-          if [ -z "$VERSION" ]; then
-            VERSION="(tidak ditemukan; cek run ${REUSE_RUN} di tab Actions)"
-            echo "::error::gagal menemukan string uname -r dari run ${REUSE_RUN}"
-            echo "::error::jangan flash release ini tanpa tahu persis Kernel Version-nya"
-            exit 1
-          fi
-          echo "  version  : ${VERSION}"
-
-          # Tag baru memakai timestamp sekarang supaya tidak bentrok dengan tag
-          # yang sudah dibuat run asal. Isi zip tetap nama aslinya lalu
-          # di-rename setelah diunduh.
-          DATE=$(date -u +%Y%m%d%H%M)
-          echo "mode=reuse" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
-          echo "DATE=${DATE}" >> "$GITHUB_ENV"
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "TAG=K-One-Kernel-${DATE}" >> "$GITHUB_ENV"
-
-      # Checkout itu wajib, bukan opsional. Langkah "Create git tag" menjalankan
-      # `git tag` dan `git push origin`, dan tanpa checkout direktori kerja bukan
-      # repo sehingga gagal dengan "fatal: not in a git directory".
-      #
-      # fetch-depth: 1 cukup karena yang dibutuhkan hanya direktori .git agar
-      # git tag bisa membuat objek tag. Tidak ada history yang diambil, jadi
-      # checkout ini tidak mengunduh repo penuh.
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # Unduh artifact dulu. Kalau ini gagal, workflow berhenti tanpa meninggalkan
-      # tag kosong di origin — versi lama men-tag sebelum memverifikasi file.
-      # Dua langkah terpisah, bukan satu dengan run-id kosong: pada mode build
-      # run-id harus benar-benar tidak diisi agar download-artifact memakai run
-      # ini sendiri, bukan run sebelumnya.
-      - name: Download zip dari run ini
-        if: ${{ steps.src.outputs.mode == 'build' }}
+      # Build kernel selalu jalan, termasuk mode reuse: yang dipulangkan di
+      # mode reuse cuma out/ sebagai titik awal, lalu bazel membangun ulang
+      # hanya bagian yang berubah. Tidak ada langkah yang menyalin Image dari
+      # run lain, karena itu bukan build yang valid.
+      - name: Download zip flashable saja
         uses: actions/download-artifact@v4
         with:
-          name: ${{ steps.src.outputs.artifact_name }}
+          name: K-One-Kernel-${{ env.DATE }}
           path: release-asset
 
-      - name: Download zip dari run sebelumnya
-        if: ${{ steps.src.outputs.mode == 'reuse' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ steps.src.outputs.artifact_name }}
-          path: release-asset
-          run-id: ${{ inputs.reuse_run }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-
-      # Di mode reuse nama zip bawaan run asal, sedangkan release memakai
-      # timestamp baru. Rename supaya nama asset konsisten dengan tag.
-      - name: Samakan nama zip dengan tag baru
-        if: ${{ steps.src.outputs.mode == 'reuse' }}
-        run: |
-          set -euo pipefail
-          mv "release-asset/${{ steps.src.outputs.artifact_name }}.zip" \
-             "release-asset/K-One-Kernel-${DATE}.zip"
-          echo "  isi: $(ls -1 release-asset)"
 
       - name: Verifikasi artifact
         run: |
@@ -656,17 +598,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.TAG }}
-          name: K-One-Kernel ${{ env.DATE }}${{ steps.src.outputs.mode == 'reuse' && inputs.reuse_dirty && ' [REUSE/UNVERIFIED]' || '' }}
+          name: K-One-Kernel ${{ env.DATE }}${{ inputs.reuse_dirty && ' [UNVERIFIED]' || '' }}
           fail_on_unmatched_files: true
           files: release-asset/K-One-Kernel-${{ env.DATE }}.zip
+          # Ditulis sebagai blok teks YAML, bukan string \n. Di dalam body:
+          # blok YAML, \n di dalam ${{ }} tidak di-escape sehingga akan muncul
+          # sebagai karakter "\" dan "n" yang nyata.
           body: |
             ## K-One-Kernel
-            ${{ steps.src.outputs.mode == 'reuse' && format('> [!WARNING]\n> Ini hasil REUSE dari run `{0}`, bukan build baru.\n> Isi kernel sama persis dengan build tersebut. Yang berubah hanya tag dan nama file.\n> Status di perangkat: belum tentu sama dengan build asal.\n', inputs.reuse_run) || '' }}
-            ${{ inputs.reuse_dirty && '> [!CAUTION]\n> Ditandai `reuse_dirty`: kernel ini belum terverifikasi boot di perangkat.\n' || '' }}
-            ${{ steps.src.outputs.mode == 'reuse' && format('Build asal: {0}\n', format('{0}/actions/runs/{1}', github.server_url, inputs.reuse_run)) || '' }}
+
+            ${{ inputs.reuse_run != '' && '> [!NOTE]' || '' }}
+            ${{ inputs.reuse_run != '' && format('> Build ini memakai `out/` dari run `{0}` sebagai titik awal, lalu dikompilasi ulang.', inputs.reuse_run) || '' }}
+            ${{ inputs.reuse_run != '' && '> Hanya bagian yang berubah yang dibangun ulang, tapi ini tetap build sungguhan, bukan hasil salin.' || '' }}
+            ${{ inputs.reuse_dirty && '> [!CAUTION]' || '' }}
+            ${{ inputs.reuse_dirty && '> Ditandai `reuse_dirty`: kernel ini belum terverifikasi boot di perangkat.' || '' }}
+
             Device Target: POCO X8 Pro / Redmi Turbo 5 (`klee`)
             SoC: MediaTek MT6899
-            Kernel: `${{ env.VERSION }}`
+            Kernel: `${{ needs.build_kernel.outputs.version }}`
             Base: GKI `android15-6.6-2025-09`
             Toolchain: Bazel/Kleaf, Clang r510928
             Root: none (KernelSU removed)
