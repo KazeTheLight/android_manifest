@@ -40,7 +40,7 @@ di kernel/sched/.
  
 +config CPU_FREQ_GOV_CASSGOV
 +	bool "'cassgov' cpufreq policy governor"
-+	depends on CPU_FREQ && SMP
++	depends on CPU_FREQ && SMP && SCHED_CASS
 +	help
 +	  CASS-aware cpufreq governor. It derives the frequency request from the
 +	  same runqueue accounting CASS uses when it compares CPUs, so realtime,
@@ -114,7 +114,7 @@ di kernel/sched/.
   * CPU original capacity and the runtime/deadline ratio of the task.
 --- /dev/null
 +++ b/kernel/sched/cpufreq_cassgov.c
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,231 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * CASS-aware cpufreq governor.
@@ -151,6 +151,7 @@ di kernel/sched/.
 + */
 +
 +#include <linux/cpufreq.h>
++#include <linux/cgroup.h>
 +#include <linux/cpumask.h>
 +#include <linux/math64.h>
 +#include <linux/minmax.h>
@@ -291,14 +292,14 @@ di kernel/sched/.
 +{
 +	struct cassgov_policy *cgp;
 +
-+	if (!policy->governor_init) {
++	if (!policy->governor_data) {
 +		cgp = kzalloc(sizeof(*cgp), GFP_KERNEL);
 +		if (!cgp)
 +			return -ENOMEM;
 +
 +		INIT_DELAYED_WORK(&cgp->work, cassgov_work);
 +		policy->governor_data = cgp;
-+		policy->governor_init = true;
++		cgp->policy = policy;
 +	}
 +
 +	policy->governor = &cassgov_gov;
@@ -311,8 +312,12 @@ di kernel/sched/.
 +	struct cassgov_policy *cgp = policy->governor_data;
 +
 +	policy->governor = NULL;
-+	policy->governor_init = false;
-+	kfree(cgp);
++	if (cgp) {
++		cgp->active = false;
++		cancel_delayed_work_sync(&cgp->work);
++		kfree(cgp);
++	}
++	policy->governor_data = NULL;
 +}
 +
 +static void cassgov_limits(struct cpufreq_policy *policy)
@@ -324,7 +329,7 @@ di kernel/sched/.
 +
 +	/* Force the next tick to re-evaluate against the new bounds. */
 +	cgp->last_freq = 0;
-+	mod_delayed_work(&cgp->work, 0);
++	mod_delayed_work(system_wq, &cgp->work, 0);
 +}
 +
 +static int __init cassgov_register(void)
