@@ -399,6 +399,18 @@ jobs:
       VERSION: ${{ needs.build_kernel.outputs.version }}
 
     steps:
+      # Checkout itu wajib, bukan opsional. Langkah "Create git tag" menjalankan
+      # `git tag` dan `git push origin`, dan tanpa checkout direktori kerja bukan
+      # repo sehingga gagal dengan "fatal: not in a git directory".
+      #
+      # fetch-depth: 1 cukup karena yang dibutuhkan hanya direktori .git agar
+      # git tag bisa membuat objek tag. Tidak ada history yang diopper, jadi
+      # checkout ini tidak mengunduh repo penuh.
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       # Unduh artifact dulu. Kalau ini gagal, workflow berhenti tanpa meninggalkan
       # tag kosong di origin — versi lama men-tag sebelum memverifikasi file.
       - name: Download zip flashable saja
