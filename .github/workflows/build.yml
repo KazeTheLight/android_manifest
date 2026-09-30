@@ -338,7 +338,10 @@ jobs:
             echo "::error::cache tidak bisa lintas branch, jalankan dari branch yang sama"
             exit 1
           fi
-          echo "  ${KEY}" >> "$GITHUB_OUTPUT"
+          # Nilai $GITHUB_OUTPUT tidak boleh diawali spasi: runner menolak dengan
+          # "Invalid format". Spasi hanya untuk tampilan log, jadi ditulis ke
+          # stdout, bukan ke file output.
+          echo "cache_key=${KEY}" >> "$GITHUB_OUTPUT"
         id: reusekey
 
       # Memakai actions/cache/restore, bukan actions/cache, supaya tidak ada
