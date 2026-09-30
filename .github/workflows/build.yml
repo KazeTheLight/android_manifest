@@ -30,8 +30,14 @@ env:
   DMDIR: kernel_device_modules-6.6
   # Bump nilai ini untuk memaksa cache objek git dibangun ulang dari nol.
   REPO_CACHE_VERSION: '3'
-  # Bump nilai ini bila format cache out/ berubah atau perlu_clean slate.
-  OUT_CACHE_VERSION: '1'
+  # Bump nilai ini bila format cache out/ berubah atau perlu clean slate.
+  # Bump juga sekali lagi setelah migrasi ke kunci berbasis-isi-file, supaya
+  # cache lama yang kuncinya berbasis hashFiles(patches/**) tidak pernah
+  # terbaca dan tidak memenuhi kuota repo tanpa pernah dipakai.
+  OUT_CACHE_VERSION: '2'
+  # Daftar file yang disentuh patch. Diisi oleh langkah "Terapkan patch", lalu
+  # dipakai untuk menghitung kunci cache dari isi file, bukan nama file patch.
+  PATCHED_FILES: /tmp/patched_files.txt
 
 defaults:
   run:
@@ -97,21 +103,12 @@ jobs:
           restore-keys: |
             kok-repo-${{ runner.os }}-${{ env.REPO_CACHE_VERSION }}-${{ env.KERNEL_MANIFEST_BRANCH }}-
 
-      # Cache output build. Ini penghematan terbesar: repo dan patch tidak
-      # berubah antar-run, jadi Bazel bisa melewati sebagian besar compile.
-      # Kunci ikut hash patch supaya patch baru tidak membaca output lama.
-      - name: Restore cache output build
-        if: inputs.use_cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            out
-            ${{ runner.temp }}/bazel_disk_cache
-          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ hashFiles('local_manifest.xml', 'patches/**', 'patches-modules/**') }}
-          restore-keys: |
-            kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-
-
+      # Cache output build sengaja dipindahkan ke setelah patch, bukan sebelum.
+      # Kuncinya dihitung dari isi file HASIL patch, jadi repo harus sudah
+      # di-patch dulu. Kunci lama memakai hashFiles('patches/**'), yang membuat
+      # rename atau renumber patch membatalkan cache meski output kernel identik.
       - name: Sync kernel source
+
         run: |
           set -euo pipefail
           repo init -u "$KERNEL_MANIFEST_URL" -b "$KERNEL_MANIFEST_BRANCH" --depth=1
@@ -150,6 +147,11 @@ jobs:
               # --reject-file=-: tolak ditulis ke log, bukan file .rej di tree.
               patch -p1 -d "$tree" --forward --batch --no-backup-if-mismatch \
                 --reject-file=- < "$p"
+              # Catat file yang disentuh. Daftar ini dipakai langkah "Hitung
+              # kunci cache" supaya kunci cache berbasis isi file hasil patch,
+              # bukan nama file patch. Kalau tidak, me-rename atau me-reorder
+              # patch membatalkan cache padahal output kernel identik.
+              grep -E '^\+\+\+ b/' "$p" | sed 's|^+++ b/||' >> "$PATCHED_FILES"
             done
             # Periksa sisa .rej sebagai jaring pengaman tambahan: dengan
             # --forward, patch yang sudah ter-apply dilewati dan patch yang
@@ -164,6 +166,7 @@ jobs:
             fi
           }
 
+          : > "$PATCHED_FILES"
           apply_patches "$KDIR" patches required
           apply_patches "$DMDIR" patches-modules optional
 
@@ -202,6 +205,54 @@ jobs:
             echo "::error::folder drivers/kernelsu masih ada"; exit 1
           fi
           echo "OK: KernelSU dibuang dari tree"
+
+      # Kunci cache dihitung dari isi file yang benar-benar berubah, bukan dari
+      # hashFiles('patches/**'). Alasannya: output kernel ditentukan oleh isi
+      # akhir file, bukan oleh nama atau urutan file patch. Dengan kunci lama,
+      # me-rename atau me-reorder patch membatalkan cache meski kernel yang
+      # dihasilkan identik.
+      #
+      # KernelSU removal di atas juga mengubah file, jadi kunci harus dihitung
+      # setelah langkah itu, bukan setelah patch saja.
+      - name: Hitung kunci cache
+        id: cachekey
+        run: |
+          set -euo pipefail
+          echo "=== file yang disentuh patch ==="
+          sort -u "$PATCHED_FILES" | tee /dev/stderr | wc -l
+
+          # Hash isi file, bukan path-nya. Patch yang menyentuh file berbeda tapi
+          # menghasilkan isi identik akan menghasilkan kunci sama, yang memang
+          # benar karena output build-nya sama.
+          HASH_INPUT=$(mktemp)
+          while read -r f; do
+            [ -n "$f" ] || continue
+            for tree in "$KDIR" "$DMDIR"; do
+              if [ -f "$tree/$f" ]; then
+                { printf '%s\0' "$f"; cat "$tree/$f"; } >> "$HASH_INPUT"
+              fi
+            done
+          done < <(sort -u "$PATCHED_FILES")
+          HASH=$(sha256sum "$HASH_INPUT" | cut -c1-32)
+          rm -f "$HASH_INPUT"
+
+          # local_manifest.xml menentukan tag sumber upstream, jadi tetap masuk.
+          MHASH=$(sha256sum local_manifest.xml | cut -c1-16)
+          echo "kunci cache out: $MHASH-$HASH"
+          echo "key=$MHASH-$HASH" >> "$GITHUB_OUTPUT"
+
+      # Cache output build. Ini penghematan terbesar: saat repo dan isi file
+      # hasil patch tidak berubah, Bazel bisa melewati sebagian besar compile.
+      - name: Restore cache output build
+        if: inputs.use_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            out
+            ${{ runner.temp }}/bazel_disk_cache
+          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ steps.cachekey.outputs.key }}
+          restore-keys: |
+            kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-
 
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -384,7 +435,7 @@ jobs:
           path: |
             out
             ${{ runner.temp }}/bazel_disk_cache
-          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ hashFiles('local_manifest.xml', 'patches/**', 'patches-modules/**') }}
+          key: kok-out-${{ runner.os }}-${{ env.OUT_CACHE_VERSION }}-${{ steps.cachekey.outputs.key }}
 
   create_release:
     name: Create Release
