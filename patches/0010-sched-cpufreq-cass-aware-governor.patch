@@ -114,7 +114,7 @@ di kernel/sched/.
   * CPU original capacity and the runtime/deadline ratio of the task.
 --- /dev/null
 +++ b/kernel/sched/cpufreq_cassgov.c
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,232 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * CASS-aware cpufreq governor.
@@ -157,6 +157,7 @@ di kernel/sched/.
 +#include <linux/minmax.h>
 +#include <linux/module.h>
 +#include <linux/sched.h>
++#include <linux/sched/cputime.h>
 +#include <linux/workqueue.h>
 +
 +#include "sched.h"
