@@ -1,0 +1,124 @@
+name: upstream-conflict-scout
+
+# Menguji merge rilis ACK Google (android15-6.6) ke kernel klee TANPA menyelesaikan konflik.
+# Tiap rilis diuji sendiri-sendiri dari titik awal yang sama (bukan kumulatif), lalu dilaporkan:
+# jumlah konflik, folder yang paling banyak konflik, dan perubahan header vendor hook.
+# Tidak ada yang di-push; hasil hanya di ringkasan job dan artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_repo:
+        description: 'Repo kernel (owner/repo)'
+        default: 'xiaomi-klee-devs/android_kernel-6.6'
+      base_branch:
+        description: 'Branch kernel klee'
+        default: 'bsp-klee-w-oss'
+      ack_url:
+        description: 'URL ACK Google'
+        default: 'https://android.googlesource.com/kernel/common'
+      refs:
+        description: 'Daftar branch ACK dipisah koma. Kosong = otomatis (rilis terbaru + android15-6.6)'
+        default: ''
+      last_n:
+        description: 'Jumlah rilis release-branch terbaru bila otomatis'
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Scout merge conflicts
+        env:
+          BASE_REPO: ${{ inputs.base_repo }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          ACK_URL: ${{ inputs.ack_url }}
+          REFS: ${{ inputs.refs }}
+          LAST_N: ${{ inputs.last_n }}
+        run: |
+          set -uo pipefail
+          WORK="${GITHUB_WORKSPACE:-$PWD}"
+          OUT="$WORK/out"; mkdir -p "$OUT"
+          SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT/summary.md}"
+          BASE_URL="${BASE_URL_OVERRIDE:-https://github.com/${BASE_REPO}.git}"
+
+          git clone -q --filter=blob:none --no-checkout "$BASE_URL" "$WORK/kernel" \
+            || git clone -q --no-checkout "$BASE_URL" "$WORK/kernel" || { echo "::error::gagal clone $BASE_URL"; exit 1; }
+          cd "$WORK/kernel"
+          git config user.name ci; git config user.email ci@example.com
+          git checkout -q -B scout "origin/$BASE_BRANCH" || { echo "::error::branch $BASE_BRANCH tidak ada"; exit 1; }
+          BASE=$(git rev-parse HEAD)
+          base_ver() { git show "$1:Makefile" 2>/dev/null | awk '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s%s", sep, $3; sep="."}'; }
+          BASE_VER=$(base_ver "$BASE")
+          git remote add ack "$ACK_URL"
+
+          fetch_ack() { git fetch -q --filter=blob:none ack "$1" 2>/dev/null || git fetch -q ack "$1" 2>/dev/null; }
+
+          if [ -z "${REFS// /}" ]; then
+            AUTO=$(git ls-remote --heads ack 'refs/heads/android15-6.6-20*' | awk '{print $2}' | sed 's|refs/heads/||' | sort -V | tail -n "$LAST_N" | tr '\n' ' ')
+            REF_LIST="$AUTO android15-6.6"
+          else
+            REF_LIST=$(echo "$REFS" | tr ',' ' ')
+          fi
+          echo "Uji ref: $REF_LIST"
+
+          {
+            echo "## Pemindai konflik upstream"
+            echo "Basis: \`$BASE_REPO@$BASE_BRANCH\` ($(git rev-parse --short "$BASE"), kernel $BASE_VER)"
+            echo
+            echo "| Ref ACK | Versi | Commit baru vs basis | Konflik | File header hook berubah |"
+            echo "|---|---|---|---|---|"
+          } > "$SUMMARY"
+          DETAIL="$OUT/detail.md"; : > "$DETAIL"
+
+          for REF in $REF_LIST; do
+            SAFE=$(echo "$REF" | tr '/' '_')
+            echo "::group::$REF"
+            if ! fetch_ack "$REF"; then
+              echo "| $REF | - | - | ref tidak ditemukan | - |" >> "$SUMMARY"
+              echo "::endgroup::"; continue
+            fi
+            TIP=$(git rev-parse FETCH_HEAD)
+            VER=$(base_ver "$TIP")
+            MB=$(git merge-base "$BASE" "$TIP" 2>/dev/null || true)
+            if [ -z "$MB" ]; then
+              echo "| $REF | $VER | - | tidak ada riwayat bersama dengan basis | - |" >> "$SUMMARY"
+              echo "::endgroup::"; continue
+            fi
+            AHEAD=$(git rev-list --count "$BASE..$TIP")
+            HOOKS=$(git diff --name-only "$MB" "$TIP" -- include/trace/hooks | wc -l)
+            git merge --no-commit --no-ff "$TIP" > "$OUT/merge-$SAFE.log" 2>&1
+            git diff --name-only --diff-filter=U | sort > "$OUT/conflicts-$SAFE.txt"
+            NC=$(wc -l < "$OUT/conflicts-$SAFE.txt")
+            git merge --abort 2>/dev/null || git reset -q --hard "$BASE"
+            git clean -fdq
+            echo "| $REF | $VER | $AHEAD | $NC | $HOOKS |" >> "$SUMMARY"
+            {
+              echo "### $REF (kernel $VER): $NC konflik"
+              if [ "$NC" -gt 0 ]; then
+                echo "Folder terbanyak:"
+                awk -F/ '{ if (NF>1) print $1"/"$2; else print $1 }' "$OUT/conflicts-$SAFE.txt" | sort | uniq -c | sort -rn | head -8 | sed 's/^/- /'
+                echo
+                echo "Konflik di area sensitif (scheduler/hook/binder/mm):"
+                grep -E '^(kernel/sched|include/trace/hooks|drivers/android|mm/)' "$OUT/conflicts-$SAFE.txt" | head -15 | sed 's/^/- /' || true
+              fi
+              echo
+            } >> "$DETAIL"
+            echo "$REF: $NC konflik, $AHEAD commit baru"
+            echo "::endgroup::"
+          done
+
+          { echo; cat "$DETAIL"; } >> "$SUMMARY"
+          echo "Selesai. Lihat ringkasan job dan artifact."
+
+      - name: Upload hasil
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-conflict-scout
+          path: out/
+          if-no-files-found: ignore
