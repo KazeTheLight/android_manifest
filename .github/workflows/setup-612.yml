@@ -54,15 +54,16 @@ jobs:
       - name: Extract MTK patches from klee 6.6
         run: |
           set -e
-          git clone --depth=150 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66 2>/dev/null || \
-          git clone --depth=150 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66
+          git clone --depth=80 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66 2>/dev/null || \
+          git clone --depth=80 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66
           cd k66
-          echo "=== Branch aktif k66: $(git branch --show-current) ==="
-          git log --oneline -n 40 | tee ../commits_k66.txt
+          echo "=== 25 Commit Teratas di klee 6.6 ==="
+          git log --oneline -n 25 | tee ../commits_k66.txt
 
-          BASE_COMMIT=$(git log --grep="ANDROID:" --author="google.com" --format="%H" -n 1 || true)
+          # Cari batas merge tag Google AOSP atau commit terakhir dari google.com
+          BASE_COMMIT=$(git log --grep="Merge tag 'android" --format="%H" -n 1 || true)
           if [ -z "$BASE_COMMIT" ]; then
-            BASE_COMMIT=$(git rev-list --max-parents=0 HEAD)
+            BASE_COMMIT=$(git log --author="google.com" --format="%H" -n 1 || git rev-list --max-parents=0 HEAD)
           fi
           echo "Detected AOSP Base Commit: $BASE_COMMIT"
           mkdir -p ../mtk_patches
