@@ -213,8 +213,8 @@ jobs:
       - name: Build kernel 6.12 (Kleaf) & capture logs
         run: |
           set -o pipefail
-          # 1. Aktifkan WORKSPACE & izinkan download dependensi WORKSPACE yang dihapus di manifest 6.12
-          sed -i 's/--noenable_bzlmod/--noenable_bzlmod --enable_workspace --repository_disable_download=false --experimental_repository_disable_download=false/g' kernel_device_modules-6.6/build.sh
+          # 1. Aktifkan WORKSPACE, izinkan download dependensi WORKSPACE, dan izinkan empty glob (Bazel 8 compat)
+          sed -i 's/--noenable_bzlmod/--noenable_bzlmod --enable_workspace --repository_disable_download=false --experimental_repository_disable_download=false --incompatible_disallow_empty_glob=false/g' kernel_device_modules-6.6/build.sh
           grep -n "enable_workspace" kernel_device_modules-6.6/build.sh || true
 
           # 2. Cek kecocokan versi Clang antara build.config.constants (6.6) dan prebuilts manifest 6.12
