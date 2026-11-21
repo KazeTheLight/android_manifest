@@ -399,6 +399,46 @@ jobs:
           grep -n 'libc\|sysroot_dir' build/kernel/kleaf/platforms/libc/BUILD.bazel build/kernel/BUILD.bazel | head -20
           grep -n 'name = "sysroot' build/kernel/kleaf/ndk.BUILD | head -20
 
+      - name: Patch visibility tools prebuilts (Kleaf 6.12)
+        run: |
+          set -euo pipefail
+
+          # build/kernel klee-devs masih memakai label file langsung
+          # (linux-x86/bin/...), sedangkan BUILD prebuilts 6.12 tidak
+          # mengekspor file tersebut.
+          if ! grep -q 'klee-612-compat' prebuilts/build-tools/BUILD.bazel; then
+            cat >> prebuilts/build-tools/BUILD.bazel <<'EOF'
+
+          # klee-612-compat: label file yang dipakai build/kernel 6.6
+          exports_files(
+              glob([
+                  "linux-x86/bin/*",
+                  "path/linux-x86/*",
+              ]),
+              visibility = ["//visibility:public"],
+          )
+          EOF
+          fi
+
+          if ! grep -q 'klee-612-compat' prebuilts/kernel-build-tools/BUILD.bazel; then
+            cat >> prebuilts/kernel-build-tools/BUILD.bazel <<'EOF'
+
+          # klee-612-compat: label file yang dipakai build/kernel 6.6
+          exports_files(
+              glob(["linux-x86/bin/*"]),
+              visibility = ["//visibility:public"],
+          )
+          EOF
+          fi
+
+          # interceptor/interceptor_analysis sudah tidak ada di prebuilts 6.12;
+          # soong_zip pindah dari kernel-build-tools ke build-tools.
+          sed -i '/prebuilts\/kernel-build-tools:linux-x86\/bin\/interceptor/d' build/kernel/BUILD.bazel
+          sed -i 's|//prebuilts/kernel-build-tools:linux-x86/bin/soong_zip|//prebuilts/build-tools:linux-x86/bin/soong_zip|' build/kernel/BUILD.bazel
+
+          grep -n 'interceptor\|soong_zip' build/kernel/BUILD.bazel || true
+          grep -n 'klee-612-compat' prebuilts/build-tools/BUILD.bazel prebuilts/kernel-build-tools/BUILD.bazel
+
       - name: Check MTK signing key
         run: |
           set -euo pipefail
