@@ -1,0 +1,111 @@
+name: Setup Linux 6.12 Base Repos for Klee
+
+on:
+  workflow_dispatch:
+    inputs:
+      aosp_612_branch:
+        description: 'Branch AOSP GKI 6.12 target'
+        default: 'common-android16-6.12'
+      target_branch:
+        description: 'Nama branch baru di fork KazeTheLight'
+        default: 'bsp-klee-6.12'
+
+jobs:
+  prepare-612:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
+          git config --global user.name "KazeTheLight-CI"
+          git config --global user.email "ci@users.noreply.github.com"
+
+      - name: Clone & Fork Branches for device_modules and vendor_modules
+        env:
+          TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
+          BR: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          for REPO in android_kernel_device_modules-6.6 android_vendor_mediatek_kernel_modules; do
+            echo "=== Menyiapkan branch $BR untuk $REPO ==="
+            git clone --depth=1 -b bsp-klee-w-oss "https://github.com/xiaomi-klee-devs/${REPO}.git" "$REPO"
+            cd "$REPO"
+            git checkout -B "$BR"
+            git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/${REPO}.git" "$BR"
+            cd ..
+            rm -rf "$REPO"
+          done
+
+      - name: Inspect MTK/Xiaomi Commits on android_kernel-6.6
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          git clone --depth=150 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git work/k66
+          cd work/k66
+          echo "=== 40 Commit Teratas di klee 6.6 ==="
+          git log --oneline -n 40 | tee ../../commits_k66.txt
+
+          # Cari commit terakhir dari Google AOSP (biasanya dari android-build-team atau merge tag android15-6.6)
+          BASE_COMMIT=$(git log --grep="ANDROID:" --author="google.com" --format="%H" -n 1 || true)
+          if [ -z "$BASE_COMMIT" ]; then
+            BASE_COMMIT=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "Detected AOSP Base Commit: $BASE_COMMIT"
+          mkdir -p ../../mtk_patches
+          git format-patch "${BASE_COMMIT}..HEAD" -o ../../mtk_patches || true
+          ls -lh ../../mtk_patches | tee ../../patch_list.txt
+
+      - name: Fetch AOSP common-android16-6.12 & Apply MTK Files
+        env:
+          AOSP_BR: ${{ inputs.aosp_612_branch }}
+          BR: ${{ inputs.target_branch }}
+          TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b "$AOSP_BR" https://android.googlesource.com/kernel/common work/k612
+          cd work/k612
+          git checkout -B "$BR"
+
+          echo "=== Cek versi kernel 6.12 ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+
+          # Salin symbol list MTK & file android/ khusus jika ada di k66
+          cp -f ../k66/android/abi_gki_aarch64_mtk android/ 2>/dev/null || true
+          git add android/
+
+          # Coba terapkan patch MTK satu per satu (lanjut jika konflik, simpan daftar gagalnya)
+          FAILED_PATCHES=""
+          for p in ../../mtk_patches/*.patch; do
+            [ -e "$p" ] || continue
+            PNAME=$(basename "$p")
+            if git am --3way "$p"; then
+              echo "[OK] $PNAME"
+            else
+              echo "[CONFLICT] $PNAME"
+              FAILED_PATCHES="${FAILED_PATCHES}\n${PNAME}"
+              git am --abort
+            fi
+          done
+
+          # Commit perubahan awal (minimal symbol list + patch yang bersih)
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add -A
+            git commit -m "klee: Initial Linux 6.12 base with clean MTK patches"
+          fi
+
+          echo -e "=== RINGKASAN PATCH GAGAL ===${FAILED_PATCHES}" | tee ../../failed_patches.txt
+
+          # Push ke repo fork KazeTheLight/android_kernel-6.6
+          git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel-6.6.git" "$BR"
+
+      - name: Upload Patch & Commit Audit Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: klee-612-migration-audit
+          path: |
+            commits_k66.txt
+            patch_list.txt
+            failed_patches.txt
+            mtk_patches/*
+            
