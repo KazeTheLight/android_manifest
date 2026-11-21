@@ -1,36 +1,34 @@
-name: build-klee-halcyon
-
-# Build kernel klee 6.6 (Kleaf) lalu hasilnya dimasukkan ke layout repo
-# device/xiaomi/klee-kernel (android_device_xiaomi_klee-kernel, branch lineage-24.0)
-# sesuai manifest ROM Halcyon. Hasil: Image.lz4, dtb/mt6899.dtb, dtbo.img,
-# system_dlkm/vendor_dlkm/vendor_ramdisk (.ko, sudah di-strip) dan modules.load.*
-# dari SATU build yang sama, sehingga kernel dan modul pasti cocok.
+name: build-klee-halcyon-6.12
 
 on:
   workflow_dispatch:
     inputs:
+      target_branch:
+        description: 'Branch 6.12 di fork KazeTheLight'
+        default: 'bsp-klee-6.12'
+      force_reinit_base:
+        description: 'Set true jika ingin memaksa ulang setup branch 6.12 di repo fork'
+        type: boolean
+        default: false
       kernel_repo:
-        description: 'Repo kernel-6.6 (owner/repo). Default = kernel yang dipakai klee-devs'
-        default: 'xiaomi-klee-devs/android_kernel-6.6'
-      kernel_branch:
-        default: 'bsp-klee-w-oss'
+        description: 'Repo kernel 6.12 (owner/repo)'
+        default: 'KazeTheLight/android_kernel-6.6'
       modules_repo:
-        description: 'Repo kernel_device_modules-6.6'
-        default: 'xiaomi-klee-devs/android_kernel_device_modules-6.6'
-      modules_branch:
-        default: 'bsp-klee-w-oss'
+        description: 'Repo kernel_device_modules'
+        default: 'KazeTheLight/android_kernel_device_modules-6.6'
       vendor_repo:
         description: 'Repo vendor/mediatek/kernel_modules'
-        default: 'xiaomi-klee-devs/android_vendor_mediatek_kernel_modules'
-      vendor_branch:
-        default: 'bsp-klee-w-oss'
+        default: 'KazeTheLight/android_vendor_mediatek_kernel_modules'
+      manifest_branch:
+        description: 'Branch manifest AOSP untuk toolchain Clang/Bazel 6.12'
+        default: 'common-android16-6.12'
       blob_repo:
         description: 'Repo blob kernel (device/xiaomi/klee-kernel)'
         default: 'xiaomi-klee-devs/android_device_xiaomi_klee-kernel'
       blob_branch:
         default: 'lineage-24.0'
       push_repo:
-        description: 'OPSIONAL: repo forkmu untuk push hasil blob (kosongkan = tidak push). Butuh secret BLOB_PUSH_TOKEN'
+        description: 'OPSIONAL: repo forkmu untuk push hasil blob (butuh secret BLOB_PUSH_TOKEN)'
         default: ''
 
 permissions:
@@ -38,7 +36,6 @@ permissions:
 
 env:
   KERNEL_MANIFEST_URL: https://android.googlesource.com/kernel/manifest
-  KERNEL_MANIFEST_BRANCH: common-android15-6.6-2025-09
   DIST: out/dist/kernel_device_modules-6.6/mgk_64_k66_kernel_aarch64.user
   BLOB_DIR: device/xiaomi/klee-kernel
 
@@ -55,7 +52,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
           df -h /
 
-      - name: Install tools
+      - name: Install tools & Git config
         run: |
           set -euo pipefail
           mkdir -p ~/.bin
@@ -64,21 +61,91 @@ jobs:
           echo "$HOME/.bin" >> "$GITHUB_PATH"
           sudo apt-get update -y
           sudo apt-get install -y device-tree-compiler python3 zip lz4
-          git config --global user.name "ci"
+          git config --global user.name "KazeTheLight-CI"
           git config --global user.email "ci@users.noreply.github.com"
           git config --global color.ui false
 
-      - name: Sync sources (AOSP manifest + local manifest)
+      - name: Checkpoint - Ensure 6.12 branches exist on KazeTheLight forks
         env:
+          TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
+          BR: ${{ inputs.target_branch }}
+          FORCE_REINIT: ${{ inputs.force_reinit_base }}
           K_REPO: ${{ inputs.kernel_repo }}
-          K_BRANCH: ${{ inputs.kernel_branch }}
           M_REPO: ${{ inputs.modules_repo }}
-          M_BRANCH: ${{ inputs.modules_branch }}
           V_REPO: ${{ inputs.vendor_repo }}
-          V_BRANCH: ${{ inputs.vendor_branch }}
         run: |
           set -euo pipefail
-          repo init -u "$KERNEL_MANIFEST_URL" -b "$KERNEL_MANIFEST_BRANCH" --depth=1
+          mkdir -p _base_tmp
+
+          # 1. Checkpoint device_modules
+          if [ "$FORCE_REINIT" != "true" ] && git ls-remote --heads "https://github.com/${M_REPO}.git" "$BR" | grep -q "$BR"; then
+            echo "[SKIP] Branch $BR sudah ada di $M_REPO"
+          else
+            test -n "$TOKEN" || { echo "::error::Secret BLOB_PUSH_TOKEN wajib diisi untuk membuat branch baru!"; exit 1; }
+            git clone --depth=1 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git _base_tmp/dev_mod 2>/dev/null || \
+            git clone --depth=1 https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git _base_tmp/dev_mod
+            git -C _base_tmp/dev_mod checkout -B "$BR"
+            git -C _base_tmp/dev_mod push -f "https://x-access-token:${TOKEN}@github.com/${M_REPO}.git" "$BR"
+          fi
+
+          # 2. Checkpoint vendor_mediatek_kernel_modules
+          if [ "$FORCE_REINIT" != "true" ] && git ls-remote --heads "https://github.com/${V_REPO}.git" "$BR" | grep -q "$BR"; then
+            echo "[SKIP] Branch $BR sudah ada di $V_REPO"
+          else
+            test -n "$TOKEN" || { echo "::error::Secret BLOB_PUSH_TOKEN wajib diisi untuk membuat branch baru!"; exit 1; }
+            git clone --depth=1 https://github.com/xiaomi-klee-devs/android_vendor_mediatek_kernel_modules.git _base_tmp/vendor_mod
+            git -C _base_tmp/vendor_mod checkout -B "$BR"
+            git -C _base_tmp/vendor_mod push -f "https://x-access-token:${TOKEN}@github.com/${V_REPO}.git" "$BR"
+          fi
+
+          # 3. Checkpoint core kernel 6.12 (orphan clean base + MTK KMI list)
+          if [ "$FORCE_REINIT" != "true" ] && git ls-remote --heads "https://github.com/${K_REPO}.git" "$BR" | grep -q "$BR"; then
+            echo "[SKIP] Branch $BR sudah ada di $K_REPO"
+          else
+            test -n "$TOKEN" || { echo "::error::Secret BLOB_PUSH_TOKEN wajib diisi untuk membuat branch baru!"; exit 1; }
+            git clone --depth=1 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git _base_tmp/k66 2>/dev/null || \
+            git clone --depth=1 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git _base_tmp/k66
+
+            AOSP_BR=$(git ls-remote --heads https://android.googlesource.com/kernel/common '*6.12*' | awk '{print $2}' | sed 's|refs/heads/||' | grep -E '^android(16|15)-6\.12$' | sort -r | head -n 1 || true)
+            if [ -z "$AOSP_BR" ]; then
+              AOSP_BR=$(git ls-remote --heads https://android.googlesource.com/kernel/common '*6.12*' | awk '{print $2}' | sed 's|refs/heads/||' | head -n 1)
+            fi
+            echo "=== Menggunakan AOSP branch: $AOSP_BR ==="
+
+            git clone --depth=1 -b "$AOSP_BR" https://android.googlesource.com/kernel/common _base_tmp/k612
+            cd _base_tmp/k612
+            git checkout --orphan "$BR"
+            git rm -rf --cached . >/dev/null 2>&1 || true
+
+            mkdir -p android
+            if [ -f ../k66/android/abi_gki_aarch64_mtk ]; then
+              cp -f ../k66/android/abi_gki_aarch64_mtk android/
+            fi
+
+            git add -A
+            git commit -m "klee: Initial Linux 6.12 base ($AOSP_BR)"
+            git push -f "https://x-access-token:${TOKEN}@github.com/${K_REPO}.git" "$BR"
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          rm -rf _base_tmp
+
+      - name: Sync sources (AOSP 6.12 manifest + KazeTheLight 6.12 forks)
+        env:
+          K_REPO: ${{ inputs.kernel_repo }}
+          M_REPO: ${{ inputs.modules_repo }}
+          V_REPO: ${{ inputs.vendor_repo }}
+          BR: ${{ inputs.target_branch }}
+          MANIFEST_BR: ${{ inputs.manifest_branch }}
+        run: |
+          set -euo pipefail
+          if ! repo init -u "$KERNEL_MANIFEST_URL" -b "$MANIFEST_BR" --depth=1 2>/dev/null; then
+            echo "Branch manifest $MANIFEST_BR tidak ditemukan, mengecek alternatif 6.12..."
+            ALT_MANIFEST=$(git ls-remote --heads "$KERNEL_MANIFEST_URL" '*6.12*' | awk '{print $2}' | sed 's|refs/heads/||' | sort -r | head -n 1)
+            echo "Menggunakan manifest: $ALT_MANIFEST"
+            repo init -u "$KERNEL_MANIFEST_URL" -b "$ALT_MANIFEST" --depth=1
+          fi
+
           mkdir -p .repo/local_manifests
           cat > .repo/local_manifests/local_manifest.xml <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -103,18 +170,24 @@ jobs:
                   <linkfile src="kleaf/bazel.WORKSPACE" dest="WORKSPACE" />
               </project>
 
-              <project path="kernel-6.6" name="${K_REPO}" remote="gh" revision="${K_BRANCH}">
+              <project path="kernel-6.6" name="${K_REPO}" remote="gh" revision="${BR}">
                   <linkfile src="build.config.constants" dest="build.config.constants" />
               </project>
-              <project path="kernel_device_modules-6.6" name="${M_REPO}" remote="gh" revision="${M_BRANCH}">
+              <project path="kernel_device_modules-6.6" name="${M_REPO}" remote="gh" revision="${BR}">
                   <linkfile src="build.config.mtk_kernel_device_modules" dest="build.config" />
               </project>
-              <project path="vendor/mediatek/kernel_modules" name="${V_REPO}" remote="gh" revision="${V_BRANCH}" />
+              <project path="vendor/mediatek/kernel_modules" name="${V_REPO}" remote="gh" revision="${BR}" />
           </manifest>
           EOF
           repo sync --force-sync --no-clone-bundle --no-tags -j"$(nproc --all)"
+
+          echo "=== Verifikasi Versi Kernel di kernel-6.6 ==="
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel-6.6/Makefile
           git -C kernel-6.6 log -1 --oneline || true
+
+          echo "=== Inspeksi build.sh & build.config.constants ==="
+          cat kernel_device_modules-6.6/build.sh
+          cat kernel-6.6/build.config.constants
 
       - name: Check MTK signing key
         run: |
@@ -132,11 +205,19 @@ jobs:
       - name: Fix Ubuntu 24.04 sandbox restriction
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-      - name: Build kernel (Kleaf)
+      - name: Build kernel 6.12 (Kleaf) & capture logs
         run: |
-          set -euo pipefail
-          ./kernel_device_modules-6.6/build.sh
+          set -o pipefail
+          ./kernel_device_modules-6.6/build.sh 2>&1 | tee kleaf_612_build.log
           ls -lh "$DIST" | head -40
+
+      - name: Upload Debug Build Log (selalu jalan meski build gagal)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kleaf-612-build-log-${{ env.DATE }}
+          if-no-files-found: ignore
+          path: kleaf_612_build.log
 
       - name: Clone blob repo (device/xiaomi/klee-kernel)
         env:
@@ -151,7 +232,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "$BLOB_DIR"
-          # extract-files.sh membaca hasil build dari ROOT_DIR/out/dist dan harus dijalankan di root repo blob
           bash ./extract-files.sh "$GITHUB_WORKSPACE"
           echo "--- ringkasan perubahan terhadap blob lama:"
           git status --short | awk '{print $1}' | sort | uniq -c
@@ -161,20 +241,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifact
-          # 1) blob tree siap pakai (tanpa .git, tanpa kernel-headers agar kecil)
-          (cd "$BLOB_DIR" && zip -r9 "$GITHUB_WORKSPACE/artifact/klee-kernel-blobs-${DATE}.zip" . -x '.git/*' 'kernel-headers/*')
-          # 2) AnyKernel3 untuk uji cepat (hanya Image; modul ROM harus cocok)
+          (cd "$BLOB_DIR" && zip -r9 "$GITHUB_WORKSPACE/artifact/klee-kernel-blobs-6.12-${DATE}.zip" . -x '.git/*' 'kernel-headers/*')
           git clone --depth=1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git
           cp "$BLOB_DIR/Image.lz4" AnyKernel3/Image
-          sed -i "s|^kernel.string=.*|kernel.string=klee 6.6.89 ${DATE}|" AnyKernel3/anykernel.sh
-          (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/artifact/AnyKernel3-klee-${DATE}.zip" .)
+          sed -i "s|^kernel.string=.*|kernel.string=klee 6.12 ${DATE}|" AnyKernel3/anykernel.sh
+          (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/artifact/AnyKernel3-klee-6.12-${DATE}.zip" .)
           ls -lh artifact
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: klee-kernel-${{ env.DATE }}
+          name: klee-kernel-6.12-${{ env.DATE }}
           path: artifact/*
           if-no-files-found: error
 
@@ -187,8 +265,9 @@ jobs:
           set -euo pipefail
           test -n "$PUSH_TOKEN" || { echo "::error::secret BLOB_PUSH_TOKEN belum diisi"; exit 1; }
           cd "$BLOB_DIR"
-          BR="kernel-update-${DATE}"
+          BR="kernel-6.12-update-${DATE}"
           git checkout -b "$BR"
           git add -A
-          git commit -m "klee-kernel: Update kernel blobs (${DATE})"
+          git commit -m "klee-kernel: Update Linux 6.12 kernel blobs (${DATE})"
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${PUSH_REPO}.git" "$BR"
+          
