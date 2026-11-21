@@ -194,6 +194,9 @@ jobs:
           cat kernel_device_modules-6.6/build.sh
           cat kernel-6.6/build.config.constants
 
+      - name: Dedupe module_outs (kompatibilitas Kleaf 6.12)
+        run: python3 scripts/patch-kleaf-6.12.py
+
       - name: Check MTK signing key
         run: |
           set -euo pipefail
