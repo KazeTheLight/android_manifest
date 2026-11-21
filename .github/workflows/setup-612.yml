@@ -30,7 +30,8 @@ jobs:
           BR: ${{ inputs.target_branch }}
         run: |
           set -euo pipefail
-          git clone --depth=1 -b bsp-klee-w-oss "https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git" dev_mod
+          git clone --depth=1 -b bsp-klee-w-oss "https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git" dev_mod 2>/dev/null || \
+          git clone --depth=1 "https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git" dev_mod
           cd dev_mod
           git checkout -B "$BR"
           git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel_device_modules-6.6.git" "$BR"
@@ -76,8 +77,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          git clone --depth=150 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git work/k66
+          git clone --depth=150 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git work/k66 2>/dev/null || \
+          git clone --depth=150 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git work/k66
           cd work/k66
+          echo "=== Branch aktif k66: $(git branch --show-current) ==="
           echo "=== 40 Commit Teratas di klee 6.6 ==="
           git log --oneline -n 40 | tee ../../commits_k66.txt
 
@@ -138,3 +141,4 @@ jobs:
             patch_list.txt
             failed_patches.txt
             mtk_patches/*
+            
