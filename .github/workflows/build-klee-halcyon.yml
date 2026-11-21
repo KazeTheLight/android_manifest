@@ -249,6 +249,156 @@ jobs:
           PY
           grep -n "klee_dedupe" kernel_device_modules-6.6/kernel/kleaf/mgk_64.bzl
 
+      - name: Patch build/kernel untuk prebuilt clang 6.12
+        run: |
+          set -euo pipefail
+
+          # Prebuilt clang 6.12 memakai platform libc dan sysroot_dir yang belum
+          # ada di build/kernel klee-devs (basis 6.6).
+          mkdir -p build/kernel/kleaf/platforms/libc
+          cat > build/kernel/kleaf/platforms/libc/BUILD.bazel <<'EOF'
+          """Describes which libc a target is using."""
+
+          constraint_setting(
+              name = "libc",
+              default_constraint_value = ":glibc",
+              visibility = ["//visibility:private"],
+          )
+
+          constraint_value(
+              name = "glibc",
+              constraint_setting = ":libc",
+              visibility = [
+                  "//build/kernel:__subpackages__",
+                  "//prebuilts/build-tools:__subpackages__",
+                  "//prebuilts/kernel-build-tools:__subpackages__",
+                  "@kleaf_clang_toolchain//:__subpackages__",
+                  "@kmod//:__subpackages__",
+              ],
+          )
+
+          constraint_value(
+              name = "musl",
+              constraint_setting = ":libc",
+              visibility = [
+                  "//build/kernel:__subpackages__",
+                  "//prebuilts/build-tools:__subpackages__",
+                  "//prebuilts/kernel-build-tools:__subpackages__",
+                  "@kleaf_clang_toolchain//:__subpackages__",
+                  "@kmod//:__subpackages__",
+              ],
+          )
+          EOF
+
+          if ! grep -q 'name = "sysroot_dir"' build/kernel/BUILD.bazel; then
+            cat >> build/kernel/BUILD.bazel <<'EOF'
+
+          filegroup(
+              name = "sysroot_dir",
+              srcs = ["build-tools/sysroot"],
+              visibility = [
+                  "@kleaf_clang_toolchain//:__subpackages__",
+              ],
+          )
+          EOF
+          fi
+
+          # NDK 6.12 memakai filegroup per-triple/per-level, bukan hanya "sysroot".
+          cat > build/kernel/kleaf/ndk.BUILD <<'EOF'
+          # Copyright (C) 2022 The Android Open Source Project
+          #
+          # Licensed under the Apache License, Version 2.0 (the "License");
+          # you may not use this file except in compliance with the License.
+          # You may obtain a copy of the License at
+          #
+          #       http://www.apache.org/licenses/LICENSE-2.0
+          #
+          # Unless required by applicable law or agreed to in writing, software
+          # distributed under the License is distributed on an "AS IS" BASIS,
+          # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+          # See the License for the specific language governing permissions and
+          # limitations under the License.
+
+          load("@bazel_skylib//lib:paths.bzl", "paths")
+
+          package(default_visibility = ["//visibility:public"])
+
+          filegroup(
+              name = "sysroot",
+              srcs = glob(
+                  [
+                      "toolchains/llvm/prebuilt/linux-x86_64/sysroot/**",
+                  ],
+                  allow_empty = False,
+              ),
+          )
+
+          _TRIPLES = [paths.basename(path) for path in glob(
+              ["toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/*"],
+              exclude_directories = 0,
+          )]
+
+          _SYSROOT_TRIPLE_COMMON_FILES = [
+              "libc.a",
+              "libdl.a",
+              "libm.a",
+          ]
+
+          _SYSROOT_TRIPLE_LEVEL_FILES = [
+              "libc.so",
+              "libdl.so",
+              "libm.so",
+              "crtbegin_dynamic.o",
+              "crtbegin_static.o",
+              "crtend_android.o",
+          ]
+
+          filegroup(
+              name = "sysroot_dir",
+              srcs = ["toolchains/llvm/prebuilt/linux-x86_64/sysroot"],
+              visibility = ["@kleaf_clang_toolchain//:__subpackages__"],
+          )
+
+          filegroup(
+              name = "sysroot_include",
+              srcs = glob(
+                  ["toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/**"],
+                  allow_empty = False,
+              ),
+              visibility = ["//visibility:private"],
+          )
+
+          [filegroup(
+              name = "sysroot_{}_common".format(triple),
+              srcs = [
+                  "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/{}/{}".format(triple, filename)
+                  for filename in _SYSROOT_TRIPLE_COMMON_FILES
+              ],
+              visibility = ["//visibility:private"],
+          ) for triple in _TRIPLES]
+
+          [filegroup(
+              name = "sysroot_{}{}_files".format(triple, level),
+              srcs = [
+                  "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/{}/{}/{}".format(triple, level, filename)
+                  for filename in _SYSROOT_TRIPLE_LEVEL_FILES
+              ] + [
+                  ":sysroot_{}_common".format(triple),
+                  ":sysroot_include",
+              ],
+              visibility = ["@kleaf_clang_toolchain//:__subpackages__"],
+          ) for triple in _TRIPLES for level in [
+              paths.basename(path)
+              for path in glob(
+                  ["toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/{}/*".format(triple)],
+                  exclude_directories = 0,
+              )
+          ]]
+          EOF
+
+          grep -n 'libc\|sysroot_dir' build/kernel/kleaf/platforms/libc/BUILD.bazel build/kernel/BUILD.bazel | head -20
+          grep -n 'name = "sysroot' build/kernel/kleaf/ndk.BUILD | head -20
+
       - name: Check MTK signing key
         run: |
           set -euo pipefail
