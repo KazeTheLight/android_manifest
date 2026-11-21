@@ -263,7 +263,15 @@ jobs:
       - name: Run extract-files.sh into blob tree
         run: |
           set -euo pipefail
+          CLANG_VER=$(grep '^CLANG_VERSION=' "$GITHUB_WORKSPACE/kernel-6.6/build.config.constants" | cut -d= -f2)
+          STRIP_BIN="$GITHUB_WORKSPACE/prebuilts/clang/host/linux-x86/clang-${CLANG_VER}/bin/llvm-strip"
+          if [ ! -x "$STRIP_BIN" ]; then
+            CLANG_VER=$(ls -d "$GITHUB_WORKSPACE"/prebuilts/clang/host/linux-x86/clang-r* | xargs -n1 basename | sed 's/^clang-//' | sort -V | tail -n1)
+          fi
+          echo "Menggunakan llvm-strip dari clang-${CLANG_VER}"
           cd "$BLOB_DIR"
+          # extract-files.sh masih hardcode clang-r510928 dari build 6.6
+          sed -i "s|^CLANG_VERISON=.*|CLANG_VERISON=clang-${CLANG_VER}|" ./extract-files.sh
           bash ./extract-files.sh "$GITHUB_WORKSPACE"
           echo "--- ringkasan perubahan terhadap blob lama:"
           git status --short | awk '{print $1}' | sort | uniq -c
