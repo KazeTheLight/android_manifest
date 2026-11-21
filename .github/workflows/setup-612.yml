@@ -93,8 +93,11 @@ jobs:
           git checkout -B "$BR"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
 
-          cp -f ../k66/android/abi_gki_aarch64_mtk android/ 2>/dev/null || true
-          git add android/
+          mkdir -p android
+          if [ -f ../k66/android/abi_gki_aarch64_mtk ]; then
+            cp -f ../k66/android/abi_gki_aarch64_mtk android/
+            git add android/abi_gki_aarch64_mtk
+          fi
 
           FAILED=""
           for p in ../mtk_patches/*.patch; do
@@ -104,7 +107,7 @@ jobs:
               echo "[OK] $PNAME"
             else
               echo "[CONFLICT] $PNAME"
-              FAILED="${FAILED}\n${p}"
+              FAILED="${FAILED}\n${PNAME}"
               git am --abort
             fi
           done
