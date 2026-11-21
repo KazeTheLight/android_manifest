@@ -146,6 +146,12 @@ jobs:
             repo init -u "$KERNEL_MANIFEST_URL" -b "$ALT_MANIFEST" --depth=1
           fi
 
+          # Auto-detect default branch asli dari klee-devs untuk build/kernel & bazel_mgk_rules
+          BUILD_KERNEL_BR=$(git ls-remote --symref https://github.com/xiaomi-klee-devs/android_build_kernel.git HEAD | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
+          MGK_RULES_BR=$(git ls-remote --symref https://github.com/xiaomi-klee-devs/kernel-build-bazel_mgk_rules.git HEAD | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
+          echo "Detected android_build_kernel branch: $BUILD_KERNEL_BR"
+          echo "Detected kernel-build-bazel_mgk_rules branch: $MGK_RULES_BR"
+
           mkdir -p .repo/local_manifests
           cat > .repo/local_manifests/local_manifest.xml <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -156,7 +162,7 @@ jobs:
               <remove-project name="kernel/build" />
               <remove-project name="kernel/common" />
 
-              <project path="build/kernel" name="android_build_kernel" remote="klee-devs" revision="bsp-klee-w-oss">
+              <project path="build/kernel" name="android_build_kernel" remote="klee-devs" revision="${BUILD_KERNEL_BR}">
                   <linkfile src="kleaf/bazel.sh" dest="tools/bazel" />
                   <linkfile src="build_test.sh" dest="build/build_test.sh" />
                   <linkfile src="config.sh" dest="build/config.sh" />
@@ -165,7 +171,7 @@ jobs:
                   <linkfile src="static_analysis" dest="build/static_analysis" />
               </project>
 
-              <project path="build/bazel_mgk_rules" name="kernel-build-bazel_mgk_rules" remote="klee-devs" revision="bsp-klee-w-oss">
+              <project path="build/bazel_mgk_rules" name="kernel-build-bazel_mgk_rules" remote="klee-devs" revision="${MGK_RULES_BR}">
                   <linkfile src="BUILD.bazel" dest="BUILD" />
                   <linkfile src="kleaf/bazel.WORKSPACE" dest="WORKSPACE" />
               </project>
@@ -188,6 +194,7 @@ jobs:
           echo "=== Inspeksi build.sh & build.config.constants ==="
           cat kernel_device_modules-6.6/build.sh
           cat kernel-6.6/build.config.constants
+
 
       - name: Check MTK signing key
         run: |
