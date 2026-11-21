@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       aosp_612_branch:
-        description: 'Branch AOSP GKI 6.12 target'
-        default: 'common-android16-6.12'
+        description: 'Branch AOSP GKI 6.12 target (android16-6.12 atau android15-6.12)'
+        default: 'android16-6.12'
       target_branch:
         description: 'Nama branch baru di fork KazeTheLight'
         default: 'bsp-klee-6.12'
@@ -63,7 +63,7 @@ jobs:
           done
 
           if [ "$FOUND" -eq 0 ]; then
-            echo "::warning::Tidak ditemukan mirror publik otomatis untuk android_vendor_mediatek_kernel_modules. Isi input vendor_source_url jika punya URL khususnya."
+            echo "::warning::Tidak ditemukan mirror publik otomatis untuk android_vendor_mediatek_kernel_modules."
             exit 0
           fi
 
@@ -93,52 +93,13 @@ jobs:
           git format-patch "${BASE_COMMIT}..HEAD" -o ../../mtk_patches || true
           ls -lh ../../mtk_patches | tee ../../patch_list.txt
 
-      - name: Fetch AOSP common-android16-6.12 & Apply MTK Files
+      - name: Fetch AOSP 6.12 & Apply MTK Files
         env:
           AOSP_BR: ${{ inputs.aosp_612_branch }}
           BR: ${{ inputs.target_branch }}
           TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          git clone --depth=1 -b "$AOSP_BR" https://android.googlesource.com/kernel/common work/k612
-          cd work/k612
-          git checkout -B "$BR"
-
-          echo "=== Cek versi kernel 6.12 ==="
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
-
-          cp -f ../k66/android/abi_gki_aarch64_mtk android/ 2>/dev/null || true
-          git add android/
-
-          FAILED_PATCHES=""
-          for p in ../../mtk_patches/*.patch; do
-            [ -e "$p" ] || continue
-            PNAME=$(basename "$p")
-            if git am --3way "$p"; then
-              echo "[OK] $PNAME"
-            else
-              echo "[CONFLICT] $PNAME"
-              FAILED_PATCHES="${FAILED_PATCHES}\n${PNAME}"
-              git am --abort
-            fi
-          done
-
-          if ! git diff --cached --quiet || ! git diff --quiet; then
-            git add -A
-            git commit -m "klee: Initial Linux 6.12 base with clean MTK patches"
-          fi
-
-          echo -e "=== RINGKASAN PATCH GAGAL ===${FAILED_PATCHES}" | tee ../../failed_patches.txt
-
-          git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel-6.6.git" "$BR"
-
-      - name: Upload Patch & Commit Audit Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: klee-612-migration-audit
-          path: |
-            commits_k66.txt
-            patch_list.txt
-            failed_patches.txt
-            mtk_patches/*
-            
+          # Cek daftar branch 6.12 yang tersedia di AOSP kernel/common jika input utama gagal
+          if ! git clone
+          
