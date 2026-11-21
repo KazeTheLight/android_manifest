@@ -215,6 +215,10 @@ jobs:
       - name: Build kernel 6.12 (Kleaf) & capture logs
         run: |
           set -o pipefail
+          # Aktifkan --enable_workspace untuk Bazel 8 pada manifest android16-6.12
+          sed -i 's/--noenable_bzlmod/--noenable_bzlmod --enable_workspace/g' kernel_device_modules-6.6/build.sh
+          grep -n "enable_workspace" kernel_device_modules-6.6/build.sh || true
+
           ./kernel_device_modules-6.6/build.sh 2>&1 | tee kleaf_612_build.log
           ls -lh "$DIST" | head -40
 
