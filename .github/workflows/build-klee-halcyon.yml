@@ -195,7 +195,59 @@ jobs:
           cat kernel-6.6/build.config.constants
 
       - name: Dedupe module_outs (kompatibilitas Kleaf 6.12)
-        run: python3 scripts/patch-kleaf-6.12.py
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("kernel_device_modules-6.6/kernel/kleaf/mgk_64.bzl")
+          text = path.read_text()
+
+          helper = '''def klee_dedupe(seq):
+              """Hapus output ganda tanpa mengubah urutan."""
+              seen = {}
+              result = []
+              for item in seq:
+                  if item not in seen:
+                      seen[item] = True
+                      result.append(item)
+              return result
+
+          '''
+          marker = 'mgk_64_defconfig = "mgk_64_k66_defconfig"'
+          if "def klee_dedupe(seq):" not in text:
+              if marker not in text:
+                  raise SystemExit("ERROR: marker mgk_64_defconfig tidak ditemukan")
+              text = text.replace(marker, helper + marker, 1)
+
+          lists = [
+              ("mgk_64_common_modules", "mgk_module_outs + mgk_64_module_outs"),
+              (
+                  "mgk_64_common_eng_modules",
+                  "mgk_module_outs + mgk_module_eng_outs + mgk_64_module_outs",
+              ),
+              (
+                  "mgk_64_common_userdebug_modules",
+                  "mgk_module_outs + mgk_module_userdebug_outs + mgk_64_module_outs",
+              ),
+              (
+                  "mgk_64_common_user_modules",
+                  "mgk_module_outs + mgk_module_user_outs + mgk_64_module_outs",
+              ),
+          ]
+          for name, expr in lists:
+              old = f"{name} = {expr}"
+              new = f"{name} = klee_dedupe({expr})"
+              if new in text:
+                  continue
+              if old not in text:
+                  raise SystemExit(f"ERROR: baris tidak ditemukan: {old}")
+              text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          print(f"OK: {path} module_outs didedupe")
+          PY
+          grep -n "klee_dedupe" kernel_device_modules-6.6/kernel/kleaf/mgk_64.bzl
 
       - name: Check MTK signing key
         run: |
