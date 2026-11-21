@@ -215,12 +215,28 @@ jobs:
       - name: Build kernel 6.12 (Kleaf) & capture logs
         run: |
           set -o pipefail
-          # Aktifkan --enable_workspace untuk Bazel 8 pada manifest android16-6.12
-          sed -i 's/--noenable_bzlmod/--noenable_bzlmod --enable_workspace/g' kernel_device_modules-6.6/build.sh
+          # 1. Aktifkan WORKSPACE & izinkan download dependensi WORKSPACE yang dihapus di manifest 6.12
+          sed -i 's/--noenable_bzlmod/--noenable_bzlmod --enable_workspace --repository_disable_download=false --experimental_repository_disable_download=false/g' kernel_device_modules-6.6/build.sh
           grep -n "enable_workspace" kernel_device_modules-6.6/build.sh || true
+
+          # 2. Cek kecocokan versi Clang antara build.config.constants (6.6) dan prebuilts manifest 6.12
+          echo "=== Prebuilt Clang tersedia di manifest 6.12 ==="
+          ls -d prebuilts/clang/host/linux-x86/clang-* || true
+          echo "=== CLANG_VERSION di kernel-6.6/build.config.constants ==="
+          grep -E '^CLANG_VERSION=' kernel-6.6/build.config.constants || true
+
+          LATEST_CLANG=$(ls -d prebuilts/clang/host/linux-x86/clang-r* | xargs -n1 basename | sed 's/^clang-//' | sort -V | tail -n 1)
+          if [ -n "$LATEST_CLANG" ] && grep -q '^CLANG_VERSION=' kernel-6.6/build.config.constants; then
+            CUR_CLANG=$(grep '^CLANG_VERSION=' kernel-6.6/build.config.constants | cut -d= -f2)
+            if [ ! -d "prebuilts/clang/host/linux-x86/clang-${CUR_CLANG}" ]; then
+              echo "Mengganti CLANG_VERSION ($CUR_CLANG -> $LATEST_CLANG) agar cocok dengan prebuilts 6.12..."
+              sed -i "s/^CLANG_VERSION=.*/CLANG_VERSION=${LATEST_CLANG}/" kernel-6.6/build.config.constants
+            fi
+          fi
 
           ./kernel_device_modules-6.6/build.sh 2>&1 | tee kleaf_612_build.log
           ls -lh "$DIST" | head -40
+
 
       - name: Upload Debug Build Log (selalu jalan meski build gagal)
         if: always()
