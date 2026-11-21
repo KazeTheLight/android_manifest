@@ -9,6 +9,9 @@ on:
       aosp_branch_override:
         description: 'Kosongkan untuk auto-detect branch 6.12 terbaru dari AOSP'
         default: ''
+      max_oem_commits:
+        description: 'Jumlah commit teratas dari klee 6.6 yang akan di-audit/port'
+        default: '15'
 
 jobs:
   setup-612:
@@ -51,23 +54,19 @@ jobs:
             rm -rf vendor_mod
           fi
 
-      - name: Extract MTK patches from klee 6.6
+      - name: Extract top OEM/MTK patches from klee 6.6
+        env:
+          MAX_C: ${{ inputs.max_oem_commits }}
         run: |
           set -e
-          git clone --depth=80 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66 2>/dev/null || \
-          git clone --depth=80 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66
+          git clone --depth=40 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66 2>/dev/null || \
+          git clone --depth=40 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66
           cd k66
-          echo "=== 25 Commit Teratas di klee 6.6 ==="
-          git log --oneline -n 25 | tee ../commits_k66.txt
+          echo "=== 20 Commit Teratas di klee 6.6 ==="
+          git log --oneline -n 20 | tee ../commits_k66.txt
 
-          # Cari batas merge tag Google AOSP atau commit terakhir dari google.com
-          BASE_COMMIT=$(git log --grep="Merge tag 'android" --format="%H" -n 1 || true)
-          if [ -z "$BASE_COMMIT" ]; then
-            BASE_COMMIT=$(git log --author="google.com" --format="%H" -n 1 || git rev-list --max-parents=0 HEAD)
-          fi
-          echo "Detected AOSP Base Commit: $BASE_COMMIT"
           mkdir -p ../mtk_patches
-          git format-patch "${BASE_COMMIT}..HEAD" -o ../mtk_patches || true
+          git format-patch "-${MAX_C}" HEAD -o ../mtk_patches || true
           ls -lh ../mtk_patches | tee ../patch_list.txt
 
       - name: Fetch AOSP 6.12, apply MTK patches & push base
@@ -94,12 +93,15 @@ jobs:
           git checkout -B "$BR"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
 
+          # 1. Commit abi_gki_aarch64_mtk dulu supaya index bersih sebelum git am
           mkdir -p android
           if [ -f ../k66/android/abi_gki_aarch64_mtk ]; then
             cp -f ../k66/android/abi_gki_aarch64_mtk android/
             git add android/abi_gki_aarch64_mtk
+            git commit -m "klee: Import MTK KMI symbol list from 6.6"
           fi
 
+          # 2. Terapkan hanya patch OEM/MTK teratas (skip patch upstream Linux murni)
           FAILED=""
           for p in ../mtk_patches/*.patch; do
             [ -e "$p" ] || continue
@@ -112,11 +114,6 @@ jobs:
               git am --abort
             fi
           done
-
-          if ! git diff --cached --quiet || ! git diff --quiet; then
-            git add -A
-            git commit -m "klee: Initial Linux 6.12 base ($AOSP_BR) with clean MTK patches"
-          fi
 
           echo -e "=== RINGKASAN PATCH GAGAL ===${FAILED}" | tee ../failed_patches.txt
           git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel-6.6.git" "$BR"
