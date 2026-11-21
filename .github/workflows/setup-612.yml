@@ -9,6 +9,9 @@ on:
       target_branch:
         description: 'Nama branch baru di fork KazeTheLight'
         default: 'bsp-klee-6.12'
+      vendor_source_url:
+        description: 'URL git sumber vendor_mediatek_kernel_modules (kosongkan untuk auto-detect)'
+        default: ''
 
 jobs:
   prepare-612:
@@ -21,21 +24,53 @@ jobs:
           git config --global user.name "KazeTheLight-CI"
           git config --global user.email "ci@users.noreply.github.com"
 
-      - name: Clone & Fork Branches for device_modules and vendor_modules
+      - name: Clone & Push Branch for device_modules
         env:
           TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
           BR: ${{ inputs.target_branch }}
         run: |
           set -euo pipefail
-          for REPO in android_kernel_device_modules-6.6 android_vendor_mediatek_kernel_modules; do
-            echo "=== Menyiapkan branch $BR untuk $REPO ==="
-            git clone --depth=1 -b bsp-klee-w-oss "https://github.com/xiaomi-klee-devs/${REPO}.git" "$REPO"
-            cd "$REPO"
-            git checkout -B "$BR"
-            git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/${REPO}.git" "$BR"
-            cd ..
-            rm -rf "$REPO"
+          git clone --depth=1 -b bsp-klee-w-oss "https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git" dev_mod
+          cd dev_mod
+          git checkout -B "$BR"
+          git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel_device_modules-6.6.git" "$BR"
+          cd ..
+          rm -rf dev_mod
+
+      - name: Auto-detect & Push vendor_mediatek_kernel_modules
+        env:
+          TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
+          BR: ${{ inputs.target_branch }}
+          CUSTOM_URL: ${{ inputs.vendor_source_url }}
+        run: |
+          set -euo pipefail
+          CANDIDATES=(
+            "$CUSTOM_URL"
+            "https://github.com/xiaomi-klee-devs/android_vendor_mediatek_kernel_modules.git"
+            "https://github.com/LineageOS/android_vendor_mediatek_kernel_modules.git"
+          )
+          FOUND=0
+          for URL in "${CANDIDATES[@]}"; do
+            [ -z "$URL" ] && continue
+            echo "Mencoba: $URL ..."
+            if git clone --depth=1 -b bsp-klee-w-oss "$URL" vendor_mod 2>/dev/null || \
+               git clone --depth=1 "$URL" vendor_mod 2>/dev/null; then
+              echo "Berhasil clone dari: $URL"
+              FOUND=1
+              break
+            fi
           done
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::warning::Tidak ditemukan mirror publik otomatis untuk android_vendor_mediatek_kernel_modules. Isi input vendor_source_url jika punya URL khususnya."
+            exit 0
+          fi
+
+          cd vendor_mod
+          git checkout -B "$BR"
+          git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_vendor_mediatek_kernel_modules.git" "$BR"
+          cd ..
+          rm -rf vendor_mod
 
       - name: Inspect MTK/Xiaomi Commits on android_kernel-6.6
         run: |
@@ -46,7 +81,6 @@ jobs:
           echo "=== 40 Commit Teratas di klee 6.6 ==="
           git log --oneline -n 40 | tee ../../commits_k66.txt
 
-          # Cari commit terakhir dari Google AOSP (biasanya dari android-build-team atau merge tag android15-6.6)
           BASE_COMMIT=$(git log --grep="ANDROID:" --author="google.com" --format="%H" -n 1 || true)
           if [ -z "$BASE_COMMIT" ]; then
             BASE_COMMIT=$(git rev-list --max-parents=0 HEAD)
@@ -70,11 +104,9 @@ jobs:
           echo "=== Cek versi kernel 6.12 ==="
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
 
-          # Salin symbol list MTK & file android/ khusus jika ada di k66
           cp -f ../k66/android/abi_gki_aarch64_mtk android/ 2>/dev/null || true
           git add android/
 
-          # Coba terapkan patch MTK satu per satu (lanjut jika konflik, simpan daftar gagalnya)
           FAILED_PATCHES=""
           for p in ../../mtk_patches/*.patch; do
             [ -e "$p" ] || continue
@@ -88,7 +120,6 @@ jobs:
             fi
           done
 
-          # Commit perubahan awal (minimal symbol list + patch yang bersih)
           if ! git diff --cached --quiet || ! git diff --quiet; then
             git add -A
             git commit -m "klee: Initial Linux 6.12 base with clean MTK patches"
@@ -96,7 +127,6 @@ jobs:
 
           echo -e "=== RINGKASAN PATCH GAGAL ===${FAILED_PATCHES}" | tee ../../failed_patches.txt
 
-          # Push ke repo fork KazeTheLight/android_kernel-6.6
           git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel-6.6.git" "$BR"
 
       - name: Upload Patch & Commit Audit Artifacts
@@ -108,4 +138,3 @@ jobs:
             patch_list.txt
             failed_patches.txt
             mtk_patches/*
-            
