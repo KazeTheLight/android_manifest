@@ -232,15 +232,10 @@ jobs:
             fi
           fi
 
-          # 3. Pulihkan build/bazel_common_rules yang dipindahkan di manifest 6.12
-          if [ ! -f build/bazel_common_rules/dist/BUILD.bazel ] && [ ! -f build/bazel_common_rules/dist/BUILD ]; then
-            if [ -d external/bazelbuild-bazel_common_rules ]; then
-              ln -sfn ../external/bazelbuild-bazel_common_rules build/bazel_common_rules
-            else
-              echo "Mengunduh build/bazel_common_rules dari AOSP..."
-              git clone --depth=1 https://android.googlesource.com/platform/build/bazel_common_rules build/bazel_common_rules
-            fi
-          fi
+          # 3. Pulihkan build/bazel_common_rules versi android15-6.6 yang cocok dengan build/kernel klee-devs
+          rm -rf build/bazel_common_rules
+          git clone --depth=1 -b common-android15-6.6 https://android.googlesource.com/platform/build/bazel_common_rules build/bazel_common_rules 2>/dev/null || \
+          git clone --depth=1 -b android15-release https://android.googlesource.com/platform/build/bazel_common_rules build/bazel_common_rules
 
           ./kernel_device_modules-6.6/build.sh 2>&1 | tee kleaf_612_build.log
           ls -lh "$DIST" | head -40
