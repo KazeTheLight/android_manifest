@@ -3,103 +3,129 @@ name: Setup Linux 6.12 Base Repos for Klee
 on:
   workflow_dispatch:
     inputs:
-      aosp_612_branch:
-        description: 'Branch AOSP GKI 6.12 target (android16-6.12 atau android15-6.12)'
-        default: 'android16-6.12'
       target_branch:
-        description: 'Nama branch baru di fork KazeTheLight'
+        description: 'Nama branch target di fork KazeTheLight'
         default: 'bsp-klee-6.12'
-      vendor_source_url:
-        description: 'URL git sumber vendor_mediatek_kernel_modules (kosongkan untuk auto-detect)'
+      aosp_branch_override:
+        description: 'Kosongkan untuk auto-detect branch 6.12 terbaru dari AOSP'
         default: ''
 
 jobs:
-  prepare-612:
+  setup-612:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Free disk space
+      - name: Free disk & setup Git
         run: |
+          set -e
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
           git config --global user.name "KazeTheLight-CI"
           git config --global user.email "ci@users.noreply.github.com"
 
-      - name: Clone & Push Branch for device_modules
+      - name: Check token & sync module branches (Checkpoint)
         env:
           TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
           BR: ${{ inputs.target_branch }}
         run: |
-          set -euo pipefail
-          git clone --depth=1 -b bsp-klee-w-oss "https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git" dev_mod 2>/dev/null || \
-          git clone --depth=1 "https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git" dev_mod
-          cd dev_mod
-          git checkout -B "$BR"
-          git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel_device_modules-6.6.git" "$BR"
-          cd ..
-          rm -rf dev_mod
+          set -e
+          test -n "$TOKEN" || { echo "Error: Secret BLOB_PUSH_TOKEN belum diisi!"; exit 1; }
 
-      - name: Auto-detect & Push vendor_mediatek_kernel_modules
-        env:
-          TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
-          BR: ${{ inputs.target_branch }}
-          CUSTOM_URL: ${{ inputs.vendor_source_url }}
-        run: |
-          set -euo pipefail
-          CANDIDATES=(
-            "$CUSTOM_URL"
-            "https://github.com/xiaomi-klee-devs/android_vendor_mediatek_kernel_modules.git"
-            "https://github.com/LineageOS/android_vendor_mediatek_kernel_modules.git"
-          )
-          FOUND=0
-          for URL in "${CANDIDATES[@]}"; do
-            [ -z "$URL" ] && continue
-            echo "Mencoba: $URL ..."
-            if git clone --depth=1 -b bsp-klee-w-oss "$URL" vendor_mod 2>/dev/null || \
-               git clone --depth=1 "$URL" vendor_mod 2>/dev/null; then
-              echo "Berhasil clone dari: $URL"
-              FOUND=1
-              break
-            fi
-          done
-
-          if [ "$FOUND" -eq 0 ]; then
-            echo "::warning::Tidak ditemukan mirror publik otomatis untuk android_vendor_mediatek_kernel_modules."
-            exit 0
+          # 1. device_modules
+          if git ls-remote --heads "https://github.com/KazeTheLight/android_kernel_device_modules-6.6.git" "$BR" | grep -q "$BR"; then
+            echo "[SKIP] Branch $BR sudah ada di android_kernel_device_modules-6.6"
+          else
+            git clone --depth=1 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git dev_mod 2>/dev/null || \
+            git clone --depth=1 https://github.com/xiaomi-klee-devs/android_kernel_device_modules-6.6.git dev_mod
+            git -C dev_mod checkout -B "$BR"
+            git -C dev_mod push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel_device_modules-6.6.git" "$BR"
+            rm -rf dev_mod
           fi
 
-          cd vendor_mod
-          git checkout -B "$BR"
-          git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_vendor_mediatek_kernel_modules.git" "$BR"
-          cd ..
-          rm -rf vendor_mod
+          # 2. vendor_mediatek_kernel_modules
+          if git ls-remote --heads "https://github.com/KazeTheLight/android_vendor_mediatek_kernel_modules.git" "$BR" | grep -q "$BR"; then
+            echo "[SKIP] Branch $BR sudah ada di android_vendor_mediatek_kernel_modules"
+          else
+            git clone --depth=1 https://github.com/xiaomi-klee-devs/android_vendor_mediatek_kernel_modules.git vendor_mod
+            git -C vendor_mod checkout -B "$BR"
+            git -C vendor_mod push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_vendor_mediatek_kernel_modules.git" "$BR"
+            rm -rf vendor_mod
+          fi
 
-      - name: Inspect MTK/Xiaomi Commits on android_kernel-6.6
+      - name: Extract MTK patches from klee 6.6
         run: |
-          set -euo pipefail
-          mkdir -p work
-          git clone --depth=150 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git work/k66 2>/dev/null || \
-          git clone --depth=150 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git work/k66
-          cd work/k66
+          set -e
+          git clone --depth=150 -b bsp-klee-w-oss https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66 2>/dev/null || \
+          git clone --depth=150 https://github.com/xiaomi-klee-devs/android_kernel-6.6.git k66
+          cd k66
           echo "=== Branch aktif k66: $(git branch --show-current) ==="
-          echo "=== 40 Commit Teratas di klee 6.6 ==="
-          git log --oneline -n 40 | tee ../../commits_k66.txt
+          git log --oneline -n 40 | tee ../commits_k66.txt
 
           BASE_COMMIT=$(git log --grep="ANDROID:" --author="google.com" --format="%H" -n 1 || true)
           if [ -z "$BASE_COMMIT" ]; then
             BASE_COMMIT=$(git rev-list --max-parents=0 HEAD)
           fi
           echo "Detected AOSP Base Commit: $BASE_COMMIT"
-          mkdir -p ../../mtk_patches
-          git format-patch "${BASE_COMMIT}..HEAD" -o ../../mtk_patches || true
-          ls -lh ../../mtk_patches | tee ../../patch_list.txt
+          mkdir -p ../mtk_patches
+          git format-patch "${BASE_COMMIT}..HEAD" -o ../mtk_patches || true
+          ls -lh ../mtk_patches | tee ../patch_list.txt
 
-      - name: Fetch AOSP 6.12 & Apply MTK Files
+      - name: Fetch AOSP 6.12, apply MTK patches & push base
         env:
-          AOSP_BR: ${{ inputs.aosp_612_branch }}
+          OVERRIDE_BR: ${{ inputs.aosp_branch_override }}
           BR: ${{ inputs.target_branch }}
           TOKEN: ${{ secrets.BLOB_PUSH_TOKEN }}
         run: |
-          set -euo pipefail
-          # Cek daftar branch 6.12 yang tersedia di AOSP kernel/common jika input utama gagal
-          if ! git clone
-          
+          set -e
+          git ls-remote --heads https://android.googlesource.com/kernel/common '*6.12*' | awk '{print $2}' | sed 's|refs/heads/||' | tee aosp_612_branches.txt
+
+          if [ -n "$OVERRIDE_BR" ]; then
+            AOSP_BR="$OVERRIDE_BR"
+          else
+            AOSP_BR=$(grep -E '^android(16|15)-6\.12$' aosp_612_branches.txt | sort -r | head -n 1 || true)
+            if [ -z "$AOSP_BR" ]; then
+              AOSP_BR=$(head -n 1 aosp_612_branches.txt)
+            fi
+          fi
+          echo "=== Menggunakan AOSP branch: $AOSP_BR ==="
+
+          git clone --depth=1 -b "$AOSP_BR" https://android.googlesource.com/kernel/common k612
+          cd k612
+          git checkout -B "$BR"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+
+          cp -f ../k66/android/abi_gki_aarch64_mtk android/ 2>/dev/null || true
+          git add android/
+
+          FAILED=""
+          for p in ../mtk_patches/*.patch; do
+            [ -e "$p" ] || continue
+            PNAME=$(basename "$p")
+            if git am --3way "$p"; then
+              echo "[OK] $PNAME"
+            else
+              echo "[CONFLICT] $PNAME"
+              FAILED="${FAILED}\n${p}"
+              git am --abort
+            fi
+          done
+
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add -A
+            git commit -m "klee: Initial Linux 6.12 base ($AOSP_BR) with clean MTK patches"
+          fi
+
+          echo -e "=== RINGKASAN PATCH GAGAL ===${FAILED}" | tee ../failed_patches.txt
+          git push -f "https://x-access-token:${TOKEN}@github.com/KazeTheLight/android_kernel-6.6.git" "$BR"
+
+      - name: Upload Migration Audit Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: klee-612-migration-audit
+          if-no-files-found: ignore
+          path: |
+            aosp_612_branches.txt
+            commits_k66.txt
+            patch_list.txt
+            failed_patches.txt
+            mtk_patches/*
+            
